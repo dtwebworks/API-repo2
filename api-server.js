@@ -1,8 +1,6 @@
 // api-server.js
-// INSTAGRAM-OPTIMIZED SMART CACHE-FIRST API + Minimal Account→Checkout flow
-// - Keeps your existing smart search endpoints (unchanged behavior)
-// - Adds protected JSON endpoint for the bot to fetch a Stripe Payment Link
-// - Uses .env for secrets (VC_API_KEY, STRIPE_CHECKOUT_URL, etc.)
+// IG-ready API + minimal Account→Checkout flow (Stripe Payment Link)
+// Works with or without .env (safe HARDCODED defaults below)
 
 const express = require('express');
 const cors = require('cors');
@@ -13,9 +11,16 @@ const axios = require('axios');
 const crypto = require('crypto');
 const cookie = require('cookie');
 require('dotenv').config();
+const { createClient } = require('@supabase/supabase-js'); // (DB disabled in this build)
 
-// Optional (DB currently disabled; left here for future use)
-const { createClient } = require('@supabase/supabase-js');
+// --- HARD DEFAULTS (used if .env is missing) ---
+const HARDCODED = {
+  API_KEY: 'autos_realer_2025_K4y7wJ9Qf2', // <- change if you want
+  STRIPE_LINK: 'https://buy.stripe.com/dRm00lbY3dwg5ZAble9R600',
+  ALLOWED_ORIGINS: ['*'], // or restrict: ['https://yourdomain.com','https://instagram.com']
+  PUBLIC_BASE_URL: null,   // null = infer from request host
+};
+// -----------------------------------------------
 
 class SmartCacheFirstAPI {
   constructor() {
@@ -23,11 +28,11 @@ class SmartCacheFirstAPI {
     this.port = process.env.PORT || 3000;
 
     // === CONFIG / SECRETS ===
-    this.apiKey = process.env.VC_API_KEY || 'your-secure-api-key';
+    this.apiKey = process.env.VC_API_KEY || HARDCODED.API_KEY;
     this.rapidApiKey = process.env.RAPIDAPI_KEY;
     this.claudeApiKey = process.env.ANTHROPIC_API_KEY;
-    this.STRIPE_CHECKOUT_URL = process.env.STRIPE_CHECKOUT_URL || 'https://buy.stripe.com/dRm00lbY3dwg5ZAble9R600';
-    this.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || null;
+    this.STRIPE_CHECKOUT_URL = process.env.STRIPE_CHECKOUT_URL || HARDCODED.STRIPE_LINK;
+    this.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || HARDCODED.PUBLIC_BASE_URL;
 
     // In-memory job storage
     this.activeJobs = new Map();
@@ -73,10 +78,9 @@ class SmartCacheFirstAPI {
     }
   }
 
-  // Build a Stripe Payment Link with optional identifiers
   buildStripeLink({ uid = 'guest', email = '' } = {}) {
     const url = new URL(this.STRIPE_CHECKOUT_URL);
-    // These params are safely ignored by Stripe if unsupported by your link
+    // harmless if the link doesn't support them
     if (uid) url.searchParams.set('client_reference_id', uid);
     if (email) url.searchParams.set('prefilled_email', email);
     return url.toString();
@@ -87,8 +91,8 @@ class SmartCacheFirstAPI {
     this.app.use(helmet());
     this.app.use(compression());
 
-    // CORS: ALLOWED_ORIGINS="*" or comma-separated list
-    const allow = (process.env.ALLOWED_ORIGINS || '*')
+    // CORS
+    const allow = (process.env.ALLOWED_ORIGINS || HARDCODED.ALLOWED_ORIGINS.join(','))
       .split(',')
       .map(s => s.trim())
       .filter(Boolean);
@@ -107,7 +111,7 @@ class SmartCacheFirstAPI {
     this.app.use(express.json({ limit: '10mb' }));
     this.app.use(express.urlencoded({ extended: true }));
 
-    // Light rate limit for API routes
+    // Rate limit
     this.app.use(
       '/api/',
       rateLimit({
@@ -119,7 +123,7 @@ class SmartCacheFirstAPI {
       })
     );
 
-    // Simple request log
+    // Tiny request log
     this.app.use((req, _res, next) => {
       console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
       next();
@@ -137,13 +141,11 @@ class SmartCacheFirstAPI {
 
   // ===== Routes =====
   setupRoutes() {
-    // Public docs
+    // Docs
     this.app.get('/api', (req, res) => res.send(this.renderDocsHtml(this.baseUrl(req))));
-
-    // Public home
+    // Home
     this.app.get('/', (req, res) => res.send(this.renderHomeHtml(this.baseUrl(req))));
-
-    // Health (public)
+    // Health
     this.app.get('/health', (_req, res) => {
       res.json({
         status: 'healthy',
@@ -162,8 +164,7 @@ class SmartCacheFirstAPI {
       });
     });
 
-    // ===== Instagram → Account → Checkout (public HTML) =====
-    // 1) IG bot DMs this link
+    // ===== IG → Account → Checkout (public HTML) =====
     this.app.get('/auth/start', (req, res) => {
       const { t, u, e, to = 'subscribe' } = req.query;
       let token = t;
@@ -173,7 +174,7 @@ class SmartCacheFirstAPI {
           email: (e || '').toString().slice(0, 256) || '',
           to: to === 'subscribe' ? 'subscribe' : 'home',
           iat: Date.now(),
-          exp: Date.now() + 2 * 60 * 60 * 1000, // 2h
+          exp: Date.now() + 2 * 60 * 60 * 1000,
           src: 'auth-start',
         };
         token = this.signPayload(payload);
@@ -181,7 +182,6 @@ class SmartCacheFirstAPI {
       res.send(this.renderAuthStartHtml(this.baseUrl(req), token));
     });
 
-    // 2) “Create/Sign in” (no DB, just validates token & sets cookie)
     this.app.post('/auth/complete', (req, res) => {
       const data = this.verifySignedToken((req.body?.token || '').toString());
       if (!data) return res.status(400).send(this.renderErrorHtml('Invalid or expired link. Tap the DM again.'));
@@ -199,7 +199,6 @@ class SmartCacheFirstAPI {
       res.send(this.renderAuthCompleteHtml(this.baseUrl(req), nextUrl));
     });
 
-    // 3) Subscribe (public redirect → Stripe)
     this.app.get('/subscribe', (req, res) => {
       const token =
         req.query.token ||
@@ -209,24 +208,22 @@ class SmartCacheFirstAPI {
       return res.redirect(302, this.buildStripeLink({ uid: data.uid, email: data.email }));
     });
 
-    // ===== Protected API =====
+    // ===== Protected API (bot) =====
     this.app.use('/api/', this.authenticateAPI.bind(this));
 
-    // ➕ NEW: JSON endpoint the IG bot can hit to fetch the Stripe link
-    // GET /api/subscribe  → { success, data: { url } }
+    // JSON: get Stripe Checkout link
     this.app.get('/api/subscribe', (req, res) => {
       const uid = (req.query.uid || '').toString().slice(0, 128) || 'guest';
       const email = (req.query.email || '').toString().slice(0, 256) || '';
       return res.json({ success: true, data: { type: 'stripe_checkout_link', url: this.buildStripeLink({ uid, email }) } });
     });
-    // Alias
     this.app.get('/api/pay', (req, res) => {
       const uid = (req.query.uid || '').toString().slice(0, 128) || 'guest';
       const email = (req.query.email || '').toString().slice(0, 256) || '';
       return res.json({ success: true, data: { type: 'stripe_checkout_link', url: this.buildStripeLink({ uid, email }) } });
     });
 
-    // Bot helper → returns one-click DM link
+    // Bot helper: return one-click DM link
     this.app.post('/api/dm/cta', (req, res) => {
       try {
         const { igUserId, username, email, returnTo = 'subscribe' } = req.body || {};
@@ -250,7 +247,7 @@ class SmartCacheFirstAPI {
       }
     });
 
-    // ===== Smart search endpoints (unchanged behavior) =====
+    // ===== Smart search endpoints (DB writes disabled) =====
     this.app.post('/api/search/smart', async (req, res) => {
       try {
         const {
@@ -473,7 +470,7 @@ class SmartCacheFirstAPI {
   renderAuthStartHtml(baseUrl, token) {
     return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Create or Sign in</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f6f7fb;margin:0}.wrap{max-width:520px;margin:0 auto;padding:32px}.card{background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.07);padding:28px;margin-top:28px}h1{font-size:22px;margin:0 0 4px}p{margin:6px 0 0;color:#60656b}.btn{width:100%;display:inline-block;padding:14px 16px;border-radius:10px;border:none;background:#111;color:#fff;font-weight:600;cursor:pointer}</style></head>
+<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f6f7fb;margin:0}.wrap{max-width:520px;margin:0 auto;padding:32px}.card{background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.07);padding:28px;margin-top:28px}h1{font-size:22px;margin:0 0 4px}p{margin:6px 0 0;color:#60656b}.btn{width:100%;display:inline-block;padding:14px 16px;border-radius:10px;border:none	background:#111;color:#fff;font-weight:600;cursor:pointer}</style></head>
 <body><div class="wrap"><div class="card">
   <h1>Sign in / Create your account</h1><p>We’ll create your account so you can finish checkout securely.</p>
   <form method="POST" action="${baseUrl}/auth/complete" style="margin-top:16px">
