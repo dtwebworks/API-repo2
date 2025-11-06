@@ -1,6 +1,7 @@
 // api-server.js
-// IG-ready API + minimal Account→Checkout flow (Stripe Payment Link)
-// Works with or without .env (safe HARDCODED defaults below)
+// COMPLETE INSTAGRAM-OPTIMIZED SMART CACHE-FIRST API SERVER
+// NOW WITH STRIPE + SUPABASE INTEGRATION FOR SUBSCRIPTIONS
+// Ready-to-deploy version with all optimizations included
 
 const express = require('express');
 const cors = require('cors');
@@ -8,890 +9,1312 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const compression = require('compression');
 const axios = require('axios');
-const crypto = require('crypto');
-const cookie = require('cookie');
+const { createClient } = require('@supabase/supabase-js');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 require('dotenv').config();
-const { createClient } = require('@supabase/supabase-js'); // (DB disabled in this build)
-
-// --- HARD DEFAULTS (used if .env is missing) ---
-const HARDCODED = {
-  API_KEY: 'autos_realer_2025_K4y7wJ9Qf2', // <- change if you want
-  STRIPE_LINK: 'https://buy.stripe.com/dRm00lbY3dwg5ZAble9R600',
-  ALLOWED_ORIGINS: ['*'], // or restrict: ['https://yourdomain.com','https://instagram.com']
-  PUBLIC_BASE_URL: null,   // null = infer from request host
-};
-// -----------------------------------------------
 
 class SmartCacheFirstAPI {
-  constructor() {
-    this.app = express();
-    this.port = process.env.PORT || 3000;
+    constructor() {
+        this.app = express();
+        this.port = process.env.PORT || 3000;
+        this.apiKey = process.env.VC_API_KEY || 'your-secure-api-key';
+        this.rapidApiKey = process.env.RAPIDAPI_KEY;
+        this.claudeApiKey = process.env.ANTHROPIC_API_KEY;
+        
+        // Initialize Supabase lazily when first needed
+        this._supabase = null;
+        this._supabaseClient = null;
 
-    // === CONFIG / SECRETS ===
-    this.apiKey = process.env.VC_API_KEY || HARDCODED.API_KEY;
-    this.rapidApiKey = process.env.RAPIDAPI_KEY;
-    this.claudeApiKey = process.env.ANTHROPIC_API_KEY;
-    this.STRIPE_CHECKOUT_URL = process.env.STRIPE_CHECKOUT_URL || HARDCODED.STRIPE_LINK;
-    this.PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || HARDCODED.PUBLIC_BASE_URL;
-
-    // In-memory job storage
-    this.activeJobs = new Map();
-    this.jobResults = new Map();
-
-    // Search settings
-    this.cacheMaxAgeDays = 30;
-    this.thresholdSteps = [5, 4, 3, 2, 1];
-
-    // (DB disabled)
-    this._supabase = null;
-
-    this.setupMiddleware();
-    this.setupRoutes();
-    this.setupErrorHandling();
-  }
-
-  // ===== Utilities =====
-  baseUrl(req) {
-    if (this.PUBLIC_BASE_URL) return this.PUBLIC_BASE_URL;
-    return `${req.protocol}://${req.get('host')}`;
-  }
-
-  signPayload(obj) {
-    const secret = this.apiKey;
-    const payload = Buffer.from(JSON.stringify(obj)).toString('base64url');
-    const sig = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-    return `${payload}.${sig}`;
-  }
-
-  verifySignedToken(token) {
-    try {
-      const secret = this.apiKey;
-      const [payload, sig] = (token || '').split('.');
-      if (!payload || !sig) return null;
-      const expected = crypto.createHmac('sha256', secret).update(payload).digest('base64url');
-      if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
-      const obj = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
-      if (obj.exp && Date.now() > obj.exp) return null;
-      return obj;
-    } catch {
-      return null;
+        
+        this.activeJobs = new Map();
+        this.jobResults = new Map();
+        
+        // Cache settings
+        this.cacheMaxAgeDays = 30;
+        this.thresholdSteps = [5, 4, 3, 2, 1];
+        
+        this.setupMiddleware();
+        this.setupRoutes();
+        this.setupErrorHandling();
     }
-  }
 
-  buildStripeLink({ uid = 'guest', email = '' } = {}) {
-    const url = new URL(this.STRIPE_CHECKOUT_URL);
-    // harmless if the link doesn't support them
-    if (uid) url.searchParams.set('client_reference_id', uid);
-    if (email) url.searchParams.set('prefilled_email', email);
-    return url.toString();
-  }
-
-  // ===== Middleware =====
-  setupMiddleware() {
-    this.app.use(helmet());
-    this.app.use(compression());
-
-    // CORS
-    const allow = (process.env.ALLOWED_ORIGINS || HARDCODED.ALLOWED_ORIGINS.join(','))
-      .split(',')
-      .map(s => s.trim())
-      .filter(Boolean);
-
-    this.app.use(
-      cors({
-        origin: (origin, cb) => {
-          if (!origin || allow.includes('*') || allow.includes(origin)) return cb(null, true);
-          return cb(new Error('CORS not allowed from this origin'), false);
-        },
-        credentials: true,
-      })
-    );
-
-    this.app.set('trust proxy', true);
-    this.app.use(express.json({ limit: '10mb' }));
-    this.app.use(express.urlencoded({ extended: true }));
-
-    // Rate limit
-    this.app.use(
-      '/api/',
-      rateLimit({
-        windowMs: 15 * 60 * 1000,
-        max: 100,
-        standardHeaders: true,
-        legacyHeaders: false,
-        message: { error: 'Too many requests from this IP, please try again later.' },
-      })
-    );
-
-    // Tiny request log
-    this.app.use((req, _res, next) => {
-      console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-      next();
-    });
-  }
-
-  // API key guard for /api/*
-  authenticateAPI(req, res, next) {
-    const k = req.headers['x-api-key'] || req.query.apiKey;
-    if (!k || k !== this.apiKey) {
-      return res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required in X-API-Key header' });
+    get supabase() {
+        console.log('🔍 SKIPPING Supabase client creation (database disabled for testing)');
+        return null;
     }
-    next();
-  }
 
-  // ===== Routes =====
-  setupRoutes() {
-    // Docs
-    this.app.get('/api', (req, res) => res.send(this.renderDocsHtml(this.baseUrl(req))));
-    // Home
-    this.app.get('/', (req, res) => res.send(this.renderHomeHtml(this.baseUrl(req))));
-    // Health
-    this.app.get('/health', (_req, res) => {
-      res.json({
-        status: 'healthy',
-        service: 'nyc_full_api',
-        version: '3.2.0',
-        timestamp: new Date().toISOString(),
-        uptime: process.uptime(),
-        features: [
-          'smart_search',
-          'job_queue',
-          'instagram_dm_ready',
-          'similar_listings_fallback',
-          'account_to_checkout_no_db',
-        ],
-        activeJobs: this.activeJobs.size,
-      });
-    });
-
-    // ===== IG → Account → Checkout (public HTML) =====
-    this.app.get('/auth/start', (req, res) => {
-      const { t, u, e, to = 'subscribe' } = req.query;
-      let token = t;
-      if (!token) {
-        const payload = {
-          uid: (u || '').toString().slice(0, 128) || 'guest',
-          email: (e || '').toString().slice(0, 256) || '',
-          to: to === 'subscribe' ? 'subscribe' : 'home',
-          iat: Date.now(),
-          exp: Date.now() + 2 * 60 * 60 * 1000,
-          src: 'auth-start',
-        };
-        token = this.signPayload(payload);
-      }
-      res.send(this.renderAuthStartHtml(this.baseUrl(req), token));
-    });
-
-    this.app.post('/auth/complete', (req, res) => {
-      const data = this.verifySignedToken((req.body?.token || '').toString());
-      if (!data) return res.status(400).send(this.renderErrorHtml('Invalid or expired link. Tap the DM again.'));
-      res.setHeader(
-        'Set-Cookie',
-        cookie.serialize('re_user', req.body.token, {
-          httpOnly: true,
-          sameSite: 'Lax',
-          secure: true,
-          path: '/',
-          maxAge: 2 * 60 * 60,
-        })
-      );
-      const nextUrl = data.to === 'subscribe' ? `/subscribe?token=${encodeURIComponent(req.body.token)}` : '/';
-      res.send(this.renderAuthCompleteHtml(this.baseUrl(req), nextUrl));
-    });
-
-    this.app.get('/subscribe', (req, res) => {
-      const token =
-        req.query.token ||
-        (req.headers.cookie && cookie.parse(req.headers.cookie || '').re_user);
-      const data = this.verifySignedToken(String(token || ''));
-      if (!data) return res.status(400).send(this.renderErrorHtml('Session missing or expired. Tap the DM again.'));
-      return res.redirect(302, this.buildStripeLink({ uid: data.uid, email: data.email }));
-    });
-
-    // ===== Protected API (bot) =====
-    this.app.use('/api/', this.authenticateAPI.bind(this));
-
-    // JSON: get Stripe Checkout link
-    this.app.get('/api/subscribe', (req, res) => {
-      const uid = (req.query.uid || '').toString().slice(0, 128) || 'guest';
-      const email = (req.query.email || '').toString().slice(0, 256) || '';
-      return res.json({ success: true, data: { type: 'stripe_checkout_link', url: this.buildStripeLink({ uid, email }) } });
-    });
-    this.app.get('/api/pay', (req, res) => {
-      const uid = (req.query.uid || '').toString().slice(0, 128) || 'guest';
-      const email = (req.query.email || '').toString().slice(0, 256) || '';
-      return res.json({ success: true, data: { type: 'stripe_checkout_link', url: this.buildStripeLink({ uid, email }) } });
-    });
-
-    // Bot helper: return one-click DM link
-    this.app.post('/api/dm/cta', (req, res) => {
-      try {
-        const { igUserId, username, email, returnTo = 'subscribe' } = req.body || {};
-        if (!igUserId && !username) {
-          return res.status(400).json({ error: 'Bad Request', message: 'igUserId or username is required' });
+    // NEW: Supabase client for Stripe integration (uses service role key)
+    getSupabaseClient() {
+        if (!this._supabaseClient) {
+            this._supabaseClient = createClient(
+                process.env.SUPABASE_URL,
+                process.env.SUPABASE_SERVICE_ROLE_KEY
+            );
+            console.log('✅ Supabase client initialized for Stripe integration');
         }
-        const identity = {
-          uid: (igUserId || username || 'guest').toString().slice(0, 128),
-          email: (email || '').toString().slice(0, 256),
-          to: returnTo === 'subscribe' ? 'subscribe' : 'home',
-          iat: Date.now(),
-          exp: Date.now() + 2 * 60 * 60 * 1000,
-          src: 'dm-cta',
-        };
-        const token = this.signPayload(identity);
-        const link = `${this.baseUrl(req)}/auth/start?t=${encodeURIComponent(token)}`;
-        return res.json({ success: true, data: { link, expiresAt: new Date(identity.exp).toISOString() } });
-      } catch (err) {
-        console.error('dm/cta error', err);
-        return res.status(500).json({ error: 'Internal Server Error', message: 'Failed to create link' });
-      }
-    });
+        return this._supabaseClient;
+    }
 
-    // ===== Smart search endpoints (DB writes disabled) =====
-    this.app.post('/api/search/smart', async (req, res) => {
-      try {
-        const {
-          neighborhood,
-          propertyType = 'rental',
-          bedrooms,
-          bathrooms,
-          undervaluationThreshold = 15,
-          minPrice,
-          maxPrice,
-          maxResults = 1,
-          noFee = false,
-          // IG opts
-          doorman = false,
-          elevator = false,
-          laundry = false,
-          privateOutdoorSpace = false,
-          washerDryer = false,
-          dishwasher = false,
-          propertyTypes = [],
-          maxHoa,
-          maxTax,
-        } = req.body;
+    setupMiddleware() {
+        this.app.use(helmet());
+        this.app.use(compression());
+        this.app.use(cors({
+            origin: process.env.ALLOWED_ORIGINS?.split(',') || ['*'],
+            credentials: true
+        }));
 
-        if (!neighborhood) {
-          return res.status(400).json({
-            error: 'Bad Request',
-            message: 'neighborhood parameter is required',
-            example: 'bushwick, soho, tribeca, williamsburg',
-          });
-        }
-
-        const jobId = this.generateJobId();
-        this.startSmartSearch(jobId, {
-          neighborhood: neighborhood.toLowerCase().replace(/\s+/g, '-'),
-          propertyType,
-          bedrooms: bedrooms ? parseInt(bedrooms) : undefined,
-          bathrooms: bathrooms ? parseFloat(bathrooms) : undefined,
-          undervaluationThreshold,
-          minPrice: minPrice ? parseInt(minPrice) : undefined,
-          maxPrice: maxPrice ? parseInt(maxPrice) : undefined,
-          maxResults: Math.min(parseInt(maxResults), 10),
-          noFee,
-          doorman,
-          elevator,
-          laundry,
-          privateOutdoorSpace,
-          washerDryer,
-          dishwasher,
-          propertyTypes,
-          maxHoa,
-          maxTax,
+        this.app.set('trust proxy', true);
+        
+        const limiter = rateLimit({
+            windowMs: 15 * 60 * 1000,
+            max: 100,
+            message: {
+                error: 'Too many requests from this IP, please try again later.',
+                retryAfter: 15 * 60
+            }
         });
-
-        res.status(202).json({
-          success: true,
-          data: {
-            jobId,
-            status: 'started',
-            message: `Smart search started for ${neighborhood}`,
-            parameters: req.body,
-            estimatedDuration: '4-8 seconds (cache-first + Instagram optimized)',
-            checkStatusUrl: `/api/jobs/${jobId}`,
-            getResultsUrl: `/api/results/${jobId}`,
-          },
+        this.app.use('/api/', limiter);
+        
+        // CRITICAL: Use raw body for webhook, JSON for everything else
+        this.app.use((req, res, next) => {
+            if (req.path === '/api/stripe/webhook') {
+                next();
+            } else {
+                express.json({ limit: '10mb' })(req, res, next);
+            }
         });
-      } catch (error) {
-        console.error('Smart search error:', error);
-        res.status(500).json({ error: 'Internal Server Error', message: 'Failed to start smart search', details: error.message });
-      }
-    });
+        this.app.use(express.urlencoded({ extended: true }));
+        
+        this.app.use((req, res, next) => {
+            console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+            next();
+        });
+    }
 
-    this.app.get('/api/cache/stats', async (_req, res) => {
-      res.json({
-        success: true,
-        data: {
-          total_requests: 0,
-          cache_only_requests: 0,
-          cache_hit_rate: 0,
-          avg_processing_time_ms: 0,
-          note: 'Database disabled for testing',
-        },
-      });
-    });
-
-    this.app.get('/api/jobs/:jobId', (req, res) => {
-      const { jobId } = req.params;
-      const job = this.activeJobs.get(jobId);
-      if (!job) return res.status(404).json({ error: 'Not Found', message: 'Job ID not found' });
-      res.json({
-        success: true,
-        data: {
-          jobId,
-          status: job.status,
-          progress: job.progress || 0,
-          startTime: job.startTime,
-          lastUpdate: job.lastUpdate,
-          message: job.message,
-          cacheHits: job.cacheHits || 0,
-          thresholdUsed: job.thresholdUsed || job.originalThreshold,
-          thresholdLowered: job.thresholdLowered || false,
-          error: job.error || null,
-        },
-      });
-    });
-
-    this.app.get('/api/results/:jobId', (req, res) => {
-      const { jobId } = req.params;
-      const results = this.jobResults.get(jobId);
-      if (!results) return res.status(404).json({ error: 'Not Found', message: 'Results not found for this job ID' });
-      res.json({ success: true, data: results });
-    });
-
-    this.app.post('/api/trigger/full-search', async (req, res) => {
-      try {
+    authenticateAPI(req, res, next) {
         const apiKey = req.headers['x-api-key'] || req.query.apiKey;
+        
+        console.log('🔍 AUTH DEBUG:');
+        console.log('  Received Key:', apiKey);
+        console.log('  Expected Key:', this.apiKey);
+        console.log('  Keys Match:', apiKey === this.apiKey);
+        
         if (!apiKey || apiKey !== this.apiKey) {
-          return res.status(401).json({ error: 'Unauthorized', message: 'Valid API key required' });
+            console.log('❌ Authentication failed');
+            return res.status(401).json({
+                error: 'Unauthorized',
+                message: 'Valid API key required in X-API-Key header'
+            });
         }
-        const searchParams = req.body;
-        const jobId = this.generateJobId();
-        this.startSmartSearch(jobId, {
-          ...searchParams,
-          neighborhood: searchParams.neighborhood?.toLowerCase().replace(/\s+/g, '-'),
-          maxResults: Math.min(parseInt(searchParams.maxResults || 1), 5),
-          source: 'railway_function_fallback',
-        });
-
-        res.status(202).json({
-          success: true,
-          data: {
-            jobId,
-            status: 'started',
-            message: `Full API search started for ${searchParams.neighborhood}`,
-            estimatedDuration: '2-5 minutes (fresh scraping + analysis)',
-            checkStatusUrl: `/api/jobs/${jobId}`,
-            getResultsUrl: `/api/results/${jobId}`,
-            source: 'railway_function_fallback',
-          },
-        });
-      } catch (error) {
-        console.error('Full API trigger error:', error);
-        res.status(500).json({ error: 'Internal Server Error', message: 'Failed to trigger full API search', details: error.message });
-      }
-    });
-  }
-
-  // ===== Error handling =====
-  setupErrorHandling() {
-    this.app.use((_req, res) => {
-      res.status(404).json({ error: 'Not Found', message: 'Endpoint not found', availableEndpoints: '/api' });
-    });
-    this.app.use((err, _req, res, _next) => {
-      console.error('Global error handler:', err);
-      res.status(500).json({ error: 'Internal Server Error', message: 'An unexpected error occurred' });
-    });
-  }
-
-  // ===== Views (HTML) =====
-  renderDocsHtml(baseUrl) {
-    return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>NYC Real Estate API - Docs</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:1200px;margin:0 auto;padding:40px 20px;line-height:1.6;color:#333;background:#f8f9fa}.container{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,.1)}.header{text-align:center;margin-bottom:40px;border-bottom:2px solid #e9ecef;padding-bottom:30px}.endpoint{margin:30px 0;padding:25px;background:#f8f9fa;border-radius:8px;border-left:4px solid #007bff}.method{background:#007bff;color:#fff;padding:4px 12px;border-radius:4px;font-weight:700;font-size:12px;display:inline-block;margin-right:10px}.method.get{background:#28a745}.method.post{background:#007bff}.command{background:#2d3748;color:#e2e8f0;padding:15px;border-radius:6px;font-family:Monaco,Menlo,monospace;font-size:13px;overflow-x:auto;margin:15px 0;white-space:pre-wrap}</style></head>
-<body><div class="container">
-<div class="header">
-  <h1>🏠 NYC Real Estate API</h1>
-  <p><strong>Base URL:</strong> <code>${baseUrl}</code></p>
-  <p><strong>Auth:</strong> <code>X-API-Key: &lt;your key&gt;</code></p>
-</div>
-
-<div class="endpoint">
-  <h3><span class="method get">GET</span>/api/subscribe</h3>
-  <p>Return Stripe checkout link as JSON (the IG bot should call this).</p>
-  <div class="command">curl "${baseUrl}/api/subscribe?uid=1789&email=user@example.com" -H "X-API-Key: &lt;KEY&gt;"</div>
-</div>
-
-<div class="endpoint">
-  <h3><span class="method post">POST</span>/api/dm/cta</h3>
-  <p>Mint a one-click DM link that guides user → account → checkout.</p>
-  <div class="command">curl -X POST ${baseUrl}/api/dm/cta -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" -d '{"username":"nyc_renter","email":"user@example.com"}'</div>
-</div>
-
-<div class="endpoint">
-  <h3><span class="method post">POST</span>/api/search/smart</h3>
-  <div class="command">curl -X POST ${baseUrl}/api/search/smart -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" -d '{"neighborhood":"soho","propertyType":"rental","maxResults":1}'</div>
-</div>
-
-<div class="endpoint">
-  <h3><span class="method get">GET</span>/api/jobs/{jobId}</h3>
-  <div class="command">curl ${baseUrl}/api/jobs/smart_123 -H "X-API-Key: &lt;KEY&gt;"</div>
-</div>
-
-<div class="endpoint">
-  <h3><span class="method get">GET</span>/api/results/{jobId}</h3>
-  <div class="command">curl ${baseUrl}/api/results/smart_123 -H "X-API-Key: &lt;KEY&gt;"</div>
-</div>
-
-</div></body></html>`;
-  }
-
-  renderHomeHtml(baseUrl) {
-    return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Realer Estate API</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:1000px;margin:0 auto;padding:40px 20px;line-height:1.6;color:#333;background:#f8f9fa}.container{background:#fff;padding:40px;border-radius:12px;box-shadow:0 4px 6px rgba(0,0,0,.1)}.header{text-align:center;margin-bottom:40px;border-bottom:2px solid #e9ecef;padding-bottom:30px}.status{background:#d4edda;color:#155724;padding:12px 20px;border-radius:6px;display:inline-block;font-weight:500;margin-bottom:20px}.section{margin:30px 0;padding:25px;background:#f8f9fa;border-radius:8px;border-left:4px solid #007bff}.command{background:#2d3748;color:#e2e8f0;padding:15px;border-radius:6px;font-family:Monaco,Menlo,monospace;font-size:13px;overflow-x:auto;margin:10px 0;white-space:pre-wrap}</style></head>
-<body><div class="container">
-  <div class="header">
-    <h1>Realer Estate API</h1>
-    <div class="status">✅ API Operational</div>
-    <p>AI-powered undervalued property discovery + IG checkout flow</p>
-  </div>
-  <div class="section">
-    <h2>Quick Test</h2>
-    <div class="command">curl -X POST ${baseUrl}/api/dm/cta -H "X-API-Key: &lt;KEY&gt;" -H "Content-Type: application/json" -d '{"username":"nyc_renter","email":"user@example.com"}'</div>
-    <div class="command">curl "${baseUrl}/api/subscribe?uid=demo&email=demo@example.com" -H "X-API-Key: &lt;KEY&gt;"</div>
-  </div>
-  <div class="section"><a href="/api">→ API Docs</a> • <a href="/health">Health</a></div>
-</div></body></html>`;
-  }
-
-  renderAuthStartHtml(baseUrl, token) {
-    return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Create or Sign in</title>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f6f7fb;margin:0}.wrap{max-width:520px;margin:0 auto;padding:32px}.card{background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.07);padding:28px;margin-top:28px}h1{font-size:22px;margin:0 0 4px}p{margin:6px 0 0;color:#60656b}.btn{width:100%;display:inline-block;padding:14px 16px;border-radius:10px;border:none	background:#111;color:#fff;font-weight:600;cursor:pointer}</style></head>
-<body><div class="wrap"><div class="card">
-  <h1>Sign in / Create your account</h1><p>We’ll create your account so you can finish checkout securely.</p>
-  <form method="POST" action="${baseUrl}/auth/complete" style="margin-top:16px">
-    <input type="hidden" name="token" value="${token}"/><button class="btn" type="submit">Continue</button>
-  </form>
-  <p style="margin-top:12px"><small>By continuing you agree to our Terms and Privacy Policy.</small></p>
-</div></div></body></html>`;
-  }
-
-  renderAuthCompleteHtml(_baseUrl, nextUrl) {
-    return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Account Ready</title><script>setTimeout(function(){location.href='${nextUrl}';},1200);</script>
-<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f6f7fb;margin:0}.wrap{max-width:520px;margin:0 auto;padding:32px}.card{background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.07);padding:28px;margin-top:28px;text-align:center}.btn{padding:12px 14px;border-radius:10px;border:none;background:#111;color:#fff;font-weight:600;cursor:pointer}</style></head>
-<body><div class="wrap"><div class="card">
-  <h2>✅ Account ready</h2><p>Taking you to checkout…</p><p><a class="btn" href="${nextUrl}">Continue now</a></p>
-</div></div></body></html>`;
-  }
-
-  renderErrorHtml(msg) {
-    return `<!doctype html><html><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Error</title><style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f6f7fb;margin:0}.wrap{max-width:520px;margin:0 auto;padding:32px}.card{background:#fff;border-radius:16px;box-shadow:0 10px 30px rgba(0,0,0,.07);padding:28px;margin-top:28px}</style></head>
-<body><div class="wrap"><div class="card"><h2>⚠️ Oops</h2><p>${msg}</p></div></div></body></html>`;
-  }
-
-  // ===== Core smart search logic (DB skipped) =====
-  async startSmartSearch(jobId, params) {
-    const start = Date.now();
-    const job = {
-      status: 'processing',
-      progress: 0,
-      startTime: new Date().toISOString(),
-      lastUpdate: new Date().toISOString(),
-      message: 'Starting smart cache-first search…',
-      originalThreshold: params.undervaluationThreshold,
-      cacheHits: 0,
-      thresholdLowered: false,
-    };
-    this.activeJobs.set(jobId, job);
-
-    let fetchRecord = null;
-    try {
-      fetchRecord = await this.createFetchRecord(jobId, params);
-
-      job.progress = 20;
-      job.message = 'Checking cache…'; job.lastUpdate = new Date().toISOString();
-      const cacheResults = await this.smartCacheSearch(params);
-      job.cacheHits = cacheResults.length;
-
-      if (cacheResults.length >= params.maxResults) {
-        job.status = 'completed'; job.progress = 100;
-        job.message = `Found ${cacheResults.length} properties from cache (instant)`;
-        await this.updateFetchRecord(fetchRecord.id, {
-          status: 'completed',
-          completed_at: new Date().toISOString(),
-          processing_duration_ms: Date.now() - start,
-          used_cache_only: true,
-          cache_hits: cacheResults.length,
-          cache_properties_returned: cacheResults.length,
-          total_properties_found: cacheResults.length,
-        });
-        this.jobResults.set(jobId, {
-          jobId, type: 'smart_search', source: 'cache_only',
-          parameters: params, properties: cacheResults,
-          instagramReady: this.formatInstagramResponse(cacheResults),
-          summary: { totalFound: cacheResults.length, cacheHits: cacheResults.length, newlyScraped: 0, thresholdUsed: params.undervaluationThreshold, thresholdLowered: false, processingTimeMs: Date.now() - start },
-          completedAt: new Date().toISOString(),
-        });
-        return;
-      }
-
-      job.progress = 40;
-      job.message = `Found ${cacheResults.length} cached; fetching fresh…`; job.lastUpdate = new Date().toISOString();
-      const streetEasyResults = await this.fetchWithThresholdFallback(params, fetchRecord.id);
-
-      if (streetEasyResults.properties.length === 0 && cacheResults.length === 0) {
-        job.progress = 70; job.message = 'No matches; looking for similar…'; job.lastUpdate = new Date().toISOString();
-        const similar = await this.fetchSimilarListings(params, fetchRecord.id);
-        if (similar.properties.length === 0) {
-          job.status = 'completed'; job.progress = 100; job.message = 'No properties found';
-          await this.updateFetchRecord(fetchRecord.id, {
-            status: 'completed', completed_at: new Date().toISOString(),
-            processing_duration_ms: Date.now() - start, total_properties_found: 0,
-          });
-          this.jobResults.set(jobId, {
-            jobId, type: 'smart_search', source: 'no_results', parameters: params,
-            properties: [], instagramReady: [], summary: { totalFound: 0, cacheHits: 0, newlyScraped: 0, thresholdUsed: params.undervaluationThreshold, thresholdLowered: false, processingTimeMs: Date.now() - start },
-            completedAt: new Date().toISOString(),
-          });
-          return;
-        } else {
-          streetEasyResults.properties = similar.properties;
-          streetEasyResults.usedSimilarFallback = true;
-          streetEasyResults.similarFallbackMessage = similar.fallbackMessage;
-          streetEasyResults.apiCalls += similar.apiCalls;
-          streetEasyResults.totalFetched += similar.totalFetched;
-          streetEasyResults.claudeApiCalls += similar.claudeApiCalls;
-          streetEasyResults.claudeCost += similar.claudeCost;
-        }
-      }
-
-      job.progress = 90; job.message = 'Combining results…'; job.lastUpdate = new Date().toISOString();
-      const combined = this.combineResults(cacheResults, streetEasyResults.properties, params.maxResults);
-      job.thresholdUsed = streetEasyResults.thresholdUsed;
-      job.thresholdLowered = streetEasyResults.thresholdLowered;
-      job.status = 'completed'; job.progress = 100;
-      job.message = streetEasyResults.usedSimilarFallback
-        ? `Found ${combined.length} similar (${cacheResults.length} cached + ${streetEasyResults.properties.length} similar)`
-        : `Found ${combined.length} total (${cacheResults.length} cached + ${streetEasyResults.properties.length} new)`;
-
-      await this.updateFetchRecord(fetchRecord.id, {
-        status: 'completed',
-        completed_at: new Date().toISOString(),
-        processing_duration_ms: Date.now() - start,
-        used_cache_only: false,
-        cache_hits: cacheResults.length,
-        cache_properties_returned: cacheResults.length,
-        streeteasy_api_calls: streetEasyResults.apiCalls,
-        streeteasy_properties_fetched: streetEasyResults.totalFetched,
-        streeteasy_properties_analyzed: streetEasyResults.totalAnalyzed,
-        total_properties_found: combined.length,
-        qualifying_properties_saved: streetEasyResults.properties.length,
-        threshold_used: streetEasyResults.thresholdUsed,
-        threshold_lowered: streetEasyResults.thresholdLowered,
-        claude_api_calls: streetEasyResults.claudeApiCalls,
-        claude_cost_usd: streetEasyResults.claudeCost,
-        used_similar_fallback: streetEasyResults.usedSimilarFallback || false,
-      });
-
-      this.jobResults.set(jobId, {
-        jobId,
-        type: 'smart_search',
-        source: streetEasyResults.usedSimilarFallback ? 'similar_listings' : 'cache_and_fresh',
-        parameters: params,
-        properties: combined,
-        instagramReady: this.formatInstagramResponse(combined),
-        cached: cacheResults,
-        newlyScraped: streetEasyResults.properties,
-        usedSimilarFallback: streetEasyResults.usedSimilarFallback || false,
-        similarFallbackMessage: streetEasyResults.similarFallbackMessage || null,
-        summary: {
-          totalFound: combined.length,
-          cacheHits: cacheResults.length,
-          newlyScraped: streetEasyResults.properties.length,
-          thresholdUsed: streetEasyResults.thresholdUsed,
-          thresholdLowered: streetEasyResults.thresholdLowered,
-          processingTimeMs: Date.now() - start,
-          claudeApiCalls: streetEasyResults.claudeApiCalls,
-          claudeCostUsd: streetEasyResults.claudeCost,
-          usedSimilarFallback: streetEasyResults.usedSimilarFallback || false,
-        },
-        completedAt: new Date().toISOString(),
-      });
-    } catch (error) {
-      console.error('❌ REAL ERROR in startSmartSearch:', error);
-      const job = this.activeJobs.get(jobId) || {};
-      job.status = 'failed';
-      job.error = error.message;
-      job.lastUpdate = new Date().toISOString();
-      this.activeJobs.set(jobId, job);
-      try {
-        if (fetchRecord?.id) {
-          await this.updateFetchRecord(fetchRecord.id, {
-            status: 'failed',
-            completed_at: new Date().toISOString(),
-            processing_duration_ms: Date.now() - start,
-            error_message: error.message,
-          });
-        }
-      } catch {}
+        
+        console.log('✅ Authentication successful');
+        next();
     }
-  }
 
-  async smartCacheSearch(_params) { console.log('🔍 SKIPPING database cache search…'); return []; }
+    setupRoutes() {
+        // ========================================================================
+        // PUBLIC ROUTES (NO AUTH REQUIRED)
+        // ========================================================================
 
-  async fetchWithThresholdFallback(params, fetchRecordId) {
-    const thresholds = [params.undervaluationThreshold, ...this.thresholdSteps.map(s => params.undervaluationThreshold - s).filter(x => x >= 1)];
-    let all = [];
-    let apiCalls = 0, totalFetched = 0, totalAnalyzed = 0, claudeApiCalls = 0, claudeTokens = 0, claudeCost = 0;
-    let thresholdUsed = params.undervaluationThreshold, thresholdLowered = false;
+        // API Documentation
+        this.app.get('/api', (req, res) => {
+            const baseUrl = req.protocol + '://' + req.get('host');
+            
+            res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NYC Real Estate API - Documentation</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1200px; 
+            margin: 0 auto; 
+            padding: 40px 20px; 
+            line-height: 1.6; 
+            color: #333;
+            background: #f8f9fa;
+        }
+        .container { 
+            background: white; 
+            padding: 40px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .header { 
+            text-align: center; 
+            margin-bottom: 40px; 
+            border-bottom: 2px solid #e9ecef; 
+            padding-bottom: 30px;
+        }
+        .endpoint { 
+            margin: 30px 0; 
+            padding: 25px; 
+            background: #f8f9fa; 
+            border-radius: 8px; 
+            border-left: 4px solid #007bff;
+        }
+        .method { 
+            background: #007bff; 
+            color: white; 
+            padding: 4px 12px; 
+            border-radius: 4px; 
+            font-weight: bold; 
+            font-size: 12px;
+            display: inline-block;
+            margin-right: 10px;
+        }
+        .method.get { background: #28a745; }
+        .method.post { background: #007bff; }
+        .command { 
+            background: #2d3748; 
+            color: #e2e8f0; 
+            padding: 15px; 
+            border-radius: 6px; 
+            font-family: 'Monaco', 'Menlo', monospace; 
+            font-size: 13px; 
+            overflow-x: auto; 
+            margin: 15px 0;
+            white-space: pre-wrap;
+        }
+        h1 { color: #2d3748; }
+        h2 { color: #4a5568; margin-top: 40px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏠 NYC Real Estate API Documentation</h1>
+            <p>Complete API reference for AI-powered property discovery</p>
+            <p><strong>Base URL:</strong> <code>${baseUrl}</code></p>
+        </div>
+        <h2>Available Endpoints</h2>
+        <div class="endpoint">
+            <h3><span class="method post">POST</span>/api/search/smart</h3>
+            <p>Search for undervalued properties (requires X-API-Key)</p>
+        </div>
+        <div class="endpoint">
+            <h3><span class="method post">POST</span>/api/preferences/save</h3>
+            <p>Save user preferences and create Stripe checkout (no auth required)</p>
+        </div>
+        <div class="endpoint">
+            <h3><span class="method get">GET</span>/api/billing/portal</h3>
+            <p>Get Stripe billing portal URL (no auth required)</p>
+        </div>
+    </div>
+</body>
+</html>
+            `);
+        });
 
-    for (const t of thresholds) {
-      console.log(`🎯 Trying threshold: ${t}%`);
-      const r = await this.fetchFromStreetEasy(params, t, fetchRecordId);
-      apiCalls += r.apiCalls; totalFetched += r.totalFetched; totalAnalyzed += r.totalAnalyzed;
-      claudeApiCalls += r.claudeApiCalls; claudeTokens += r.claudeTokens; claudeCost += r.claudeCost;
-      if (r.properties.length > 0) { thresholdUsed = t; thresholdLowered = t < params.undervaluationThreshold; all = r.properties; break; }
+        // Homepage
+        this.app.get('/', (req, res) => {
+            const baseUrl = req.protocol + '://' + req.get('host');
+            res.send(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NYC Real Estate API</title>
+    <style>
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            max-width: 1000px; 
+            margin: 0 auto; 
+            padding: 40px 20px; 
+            line-height: 1.6; 
+            color: #333;
+            background: #f8f9fa;
+        }
+        .container { 
+            background: white; 
+            padding: 40px; 
+            border-radius: 12px; 
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .header { 
+            text-align: center; 
+            margin-bottom: 40px; 
+            border-bottom: 2px solid #e9ecef; 
+            padding-bottom: 30px;
+        }
+        .status { 
+            background: #d4edda; 
+            color: #155724; 
+            padding: 12px 20px; 
+            border-radius: 6px; 
+            display: inline-block; 
+            font-weight: 500;
+            margin-bottom: 20px;
+        }
+        h1 { color: #2d3748; margin-bottom: 10px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Realer Estate API</h1>
+            <div class="status">✅ API Operational</div>
+            <p>AI-powered undervalued property discovery</p>
+        </div>
+        <p><a href="/api">→ Full API Documentation</a></p>
+        <p><a href="/health">→ Health Check</a></p>
+    </div>
+</body>
+</html>
+            `);
+        });
+
+        // Health check
+        this.app.get('/health', (req, res) => {
+            res.json({
+                status: 'healthy',
+                service: 'nyc_full_api',
+                timestamp: new Date().toISOString(),
+                uptime: process.uptime(),
+                version: '3.1.0',
+                features: [
+                    'smart_search',
+                    'stripe_integration',
+                    'subscription_management',
+                    'instagram_dm_ready'
+                ],
+                activeJobs: this.activeJobs.size
+            });
+        });
+
+        // ========================================================================
+        // NEW: STRIPE + SUPABASE INTEGRATION ROUTES (NO AUTH)
+        // ========================================================================
+
+        this.setupPreferencesRoute();
+        this.setupWebhookRoute();
+        this.setupBillingPortalRoute();
+
+        // ========================================================================
+        // PROTECTED ROUTES (REQUIRE X-API-KEY)
+        // ========================================================================
+
+        this.app.use('/api/', this.authenticateAPI.bind(this));
+
+        // Smart property search
+        this.app.post('/api/search/smart', async (req, res) => {
+            try {
+                const {
+                    neighborhood,
+                    propertyType = 'rental',
+                    bedrooms,
+                    bathrooms,
+                    undervaluationThreshold = 15,
+                    minPrice,
+                    maxPrice,
+                    maxResults = 1,
+                    noFee = false,
+                    doorman = false,
+                    elevator = false,
+                    laundry = false,
+                    privateOutdoorSpace = false,
+                    washerDryer = false,
+                    dishwasher = false,
+                    propertyTypes = [],
+                    maxHoa,
+                    maxTax
+                } = req.body;
+
+                if (!neighborhood) {
+                    return res.status(400).json({
+                        error: 'Bad Request',
+                        message: 'neighborhood parameter is required',
+                        example: 'bushwick, soho, tribeca, williamsburg'
+                    });
+                }
+
+                const jobId = this.generateJobId();
+                
+                this.startSmartSearch(jobId, {
+                    neighborhood: neighborhood.toLowerCase().replace(/\s+/g, '-'),
+                    propertyType,
+                    bedrooms: bedrooms ? parseInt(bedrooms) : undefined,
+                    bathrooms: bathrooms ? parseFloat(bathrooms) : undefined,
+                    undervaluationThreshold,
+                    minPrice: minPrice ? parseInt(minPrice) : undefined,
+                    maxPrice: maxPrice ? parseInt(maxPrice) : undefined,
+                    maxResults: Math.min(parseInt(maxResults), 10),
+                    noFee
+                });
+
+                res.status(202).json({
+                    success: true,
+                    data: {
+                        jobId: jobId,
+                        status: 'started',
+                        message: `Smart search started for ${neighborhood}`,
+                        parameters: req.body,
+                        estimatedDuration: '4-8 seconds',
+                        checkStatusUrl: `/api/jobs/${jobId}`,
+                        getResultsUrl: `/api/results/${jobId}`
+                    }
+                });
+
+            } catch (error) {
+                console.error('Smart search error:', error);
+                res.status(500).json({
+                    error: 'Internal Server Error',
+                    message: 'Failed to start smart search',
+                    details: error.message
+                });
+            }
+        });
+
+        // Job status endpoint
+        this.app.get('/api/jobs/:jobId', (req, res) => {
+            const { jobId } = req.params;
+            const job = this.activeJobs.get(jobId);
+            
+            if (!job) {
+                return res.status(404).json({
+                    error: 'Not Found',
+                    message: 'Job ID not found'
+                });
+            }
+
+            res.json({
+                success: true,
+                data: {
+                    jobId: jobId,
+                    status: job.status,
+                    progress: job.progress || 0,
+                    startTime: job.startTime,
+                    lastUpdate: job.lastUpdate,
+                    message: job.message,
+                    error: job.error || null
+                }
+            });
+        });
+
+        // Job results endpoint
+        this.app.get('/api/results/:jobId', (req, res) => {
+            const { jobId } = req.params;
+            const results = this.jobResults.get(jobId);
+            
+            if (!results) {
+                return res.status(404).json({
+                    error: 'Not Found',
+                    message: 'Results not found for this job ID'
+                });
+            }
+            res.json({
+                success: true,
+                data: results
+            });
+        });
+
+        // Cache stats
+        this.app.get('/api/cache/stats', async (req, res) => {
+            res.json({
+                success: true,
+                data: {
+                    total_requests: 0,
+                    cache_only_requests: 0,
+                    cache_hit_rate: 0,
+                    avg_processing_time_ms: 0,
+                    note: 'Database disabled for testing'
+                }
+            });
+        });
+
+        // Trigger full search from Railway Function
+        this.app.post('/api/trigger/full-search', async (req, res) => {
+            try {
+                const searchParams = req.body;
+                
+                console.log('🚀 Full API triggered by Railway Function');
+                
+                const jobId = this.generateJobId();
+                
+                this.startSmartSearch(jobId, {
+                    ...searchParams,
+                    neighborhood: searchParams.neighborhood?.toLowerCase().replace(/\s+/g, '-'),
+                    maxResults: Math.min(parseInt(searchParams.maxResults || 1), 5),
+                    source: 'railway_function_fallback'
+                });
+
+                res.status(202).json({
+                    success: true,
+                    data: {
+                        jobId: jobId,
+                        status: 'started',
+                        message: `Full API search started for ${searchParams.neighborhood}`,
+                        estimatedDuration: '2-5 minutes',
+                        checkStatusUrl: `/api/jobs/${jobId}`,
+                        getResultsUrl: `/api/results/${jobId}`,
+                        source: 'railway_function_fallback'
+                    }
+                });
+
+            } catch (error) {
+                console.error('Full API trigger error:', error);
+                res.status(500).json({
+                    error: 'Internal Server Error',
+                    message: 'Failed to trigger full API search',
+                    details: error.message
+                });
+            }
+        });
     }
-    return { properties: all, thresholdUsed, thresholdLowered, apiCalls, totalFetched, totalAnalyzed, claudeApiCalls, claudeTokens, claudeCost };
-  }
 
-  async fetchSimilarListings(originalParams, fetchRecordId) {
-    console.log('🔄 Progressive fallback…');
+    // ============================================================================
+    // NEW: STRIPE + SUPABASE ROUTE IMPLEMENTATIONS
+    // ============================================================================
 
-    if (originalParams.maxPrice) {
-      const ms = [1.2, 1.5, 2.0, 3.0, 5.0, 10.0];
-      for (const m of ms) {
-        const r = await this.fetchFromStreetEasy(
-          { ...originalParams, maxPrice: Math.round(originalParams.maxPrice * m), minPrice: undefined, undervaluationThreshold: 1 },
-          1,
-          fetchRecordId
+    setupPreferencesRoute() {
+        this.app.post('/api/preferences/save', async (req, res) => {
+            try {
+                const {
+                    email,
+                    instagram_handle,
+                    bedrooms,
+                    max_budget,
+                    preferred_neighborhoods,
+                    neighborhood_preferences,
+                    discount_threshold,
+                    property_type,
+                    marketing_channel,
+                    subscription_renewal = 'monthly'
+                } = req.body;
+
+                // Validate required fields
+                if (!email || !email.includes('@')) {
+                    return res.status(400).json({
+                        error: 'Invalid email address'
+                    });
+                }
+
+                // Sanitize and validate inputs
+                const sanitizedEmail = email.toLowerCase().trim();
+                const sanitizedNeighborhoods = (preferred_neighborhoods || neighborhood_preferences || [])
+                    .map(n => n.toLowerCase().trim());
+                
+                const validatedBedrooms = bedrooms ? Math.min(Math.max(parseInt(bedrooms), 0), 10) : null;
+                const validatedBudget = max_budget ? Math.max(parseInt(max_budget), 0) : null;
+                const validatedDiscount = discount_threshold ? Math.min(Math.max(parseInt(discount_threshold), 1), 100) : 15;
+
+                console.log('💾 Upserting profile:', {
+                    email: sanitizedEmail,
+                    instagram_handle,
+                    neighborhoods: sanitizedNeighborhoods
+                });
+
+                // Upsert profile to Supabase
+                const supabase = this.getSupabaseClient();
+                
+                const { data: existingProfile, error: fetchError } = await supabase
+                    .from('profiles')
+                    .select('id, stripe_customer_id')
+                    .eq('email_address', sanitizedEmail)
+                    .single();
+
+                let profileId;
+                let stripeCustomerId = existingProfile?.stripe_customer_id;
+
+                if (existingProfile) {
+                    // Update existing profile
+                    const { data: updated, error: updateError } = await supabase
+                        .from('profiles')
+                        .update({
+                            instagram_handle,
+                            bedrooms: validatedBedrooms,
+                            max_budget: validatedBudget,
+                            preferred_neighborhoods: sanitizedNeighborhoods,
+                            neighborhood_preferences: sanitizedNeighborhoods,
+                            discount_threshold: validatedDiscount,
+                            property_type,
+                            marketing_channel,
+                            subscription_renewal
+                        })
+                        .eq('id', existingProfile.id)
+                        .select()
+                        .single();
+
+                    if (updateError) throw updateError;
+                    profileId = existingProfile.id;
+                    console.log('✅ Updated existing profile:', profileId);
+                } else {
+                    // Create new profile
+                    const { data: created, error: createError } = await supabase
+                        .from('profiles')
+                        .insert({
+                            email_address: sanitizedEmail,
+                            instagram_handle,
+                            bedrooms: validatedBedrooms,
+                            max_budget: validatedBudget,
+                            preferred_neighborhoods: sanitizedNeighborhoods,
+                            neighborhood_preferences: sanitizedNeighborhoods,
+                            discount_threshold: validatedDiscount,
+                            property_type,
+                            marketing_channel,
+                            subscription_plan: 'free',
+                            subscription_renewal,
+                            is_canceled: false
+                        })
+                        .select()
+                        .single();
+
+                    if (createError) throw createError;
+                    profileId = created.id;
+                    console.log('✅ Created new profile:', profileId);
+                }
+
+                // Create Stripe Checkout Session
+                const priceId = subscription_renewal === 'annual'
+                    ? process.env.STRIPE_PRICE_UNLIMITED_ANNUAL
+                    : process.env.STRIPE_PRICE_UNLIMITED_MONTHLY;
+
+                const session = await stripe.checkout.sessions.create({
+                    mode: 'subscription',
+                    payment_method_types: ['card'],
+                    line_items: [{
+                        price: priceId,
+                        quantity: 1
+                    }],
+                    customer_email: sanitizedEmail,
+                    client_reference_id: profileId,
+                    metadata: {
+                        profile_id: profileId,
+                        instagram_handle: instagram_handle || '',
+                        neighborhood: sanitizedNeighborhoods[0] || 'nyc'
+                    },
+                    success_url: process.env.STRIPE_SUCCESS_URL,
+                    cancel_url: process.env.STRIPE_CANCEL_URL,
+                    allow_promotion_codes: true
+                });
+
+                console.log('💳 Stripe Checkout created:', session.id);
+                console.log('📧 Customer email:', sanitizedEmail);
+                console.log('🆔 Profile ID:', profileId);
+
+                res.json({
+                    success: true,
+                    checkoutUrl: session.url,
+                    profileId,
+                    sessionId: session.id
+                });
+
+            } catch (error) {
+                console.error('❌ Preferences save error:', error);
+                res.status(500).json({
+                    error: 'Failed to save preferences',
+                    message: error.message
+                });
+            }
+        });
+    }
+
+    setupWebhookRoute() {
+        this.app.post('/api/stripe/webhook',
+            express.raw({ type: 'application/json' }),
+            async (req, res) => {
+                const sig = req.headers['stripe-signature'];
+                let event;
+
+                try {
+                    event = stripe.webhooks.constructEvent(
+                        req.body,
+                        sig,
+                        process.env.STRIPE_WEBHOOK_SECRET
+                    );
+                } catch (err) {
+                    console.error('⚠️ Webhook signature verification failed:', err.message);
+                    return res.status(400).send(`Webhook Error: ${err.message}`);
+                }
+
+                console.log('🎣 Webhook received:', event.type);
+
+                try {
+                    const supabase = this.getSupabaseClient();
+
+                    switch (event.type) {
+                        case 'checkout.session.completed': {
+                            const session = event.data.object;
+                            
+                            console.log('✅ Checkout completed:', {
+                                session_id: session.id,
+                                customer: session.customer,
+                                email: session.customer_email,
+                                profile_id: session.client_reference_id
+                            });
+
+                            let subscriptionRenewal = 'monthly';
+                            if (session.subscription) {
+                                const subscription = await stripe.subscriptions.retrieve(session.subscription);
+                                const interval = subscription.items.data[0]?.price?.recurring?.interval;
+                                subscriptionRenewal = interval === 'year' ? 'annual' : 'monthly';
+                            }
+
+                            const { error: updateError } = await supabase
+                                .from('profiles')
+                                .update({
+                                    stripe_customer_id: session.customer,
+                                    subscription_plan: 'unlimited',
+                                    subscription_renewal: subscriptionRenewal,
+                                    is_canceled: false
+                                })
+                                .or(`id.eq.${session.client_reference_id},email_address.eq.${session.customer_email}`);
+
+                            if (updateError) {
+                                console.error('❌ Profile update error:', updateError);
+                            } else {
+                                console.log('✅ Profile activated:', session.client_reference_id);
+                            }
+                            break;
+                        }
+
+                        case 'customer.subscription.updated': {
+                            const subscription = event.data.object;
+                            
+                            console.log('🔄 Subscription updated:', {
+                                customer: subscription.customer,
+                                status: subscription.status
+                            });
+
+                            const isCanceled = ['canceled', 'incomplete_expired'].includes(subscription.status);
+                            const interval = subscription.items.data[0]?.price?.recurring?.interval;
+                            const subscriptionRenewal = interval === 'year' ? 'annual' : 'monthly';
+
+                            const { error: updateError } = await supabase
+                                .from('profiles')
+                                .update({
+                                    subscription_renewal: subscriptionRenewal,
+                                    is_canceled: isCanceled,
+                                    ...(isCanceled ? { subscription_plan: 'free' } : {})
+                                })
+                                .eq('stripe_customer_id', subscription.customer);
+
+                            if (updateError) {
+                                console.error('❌ Subscription update error:', updateError);
+                            } else {
+                                console.log('✅ Subscription synced:', subscription.customer);
+                            }
+                            break;
+                        }
+
+                        case 'customer.subscription.deleted': {
+                            const subscription = event.data.object;
+                            
+                            console.log('❌ Subscription canceled:', subscription.customer);
+
+                            const { error: updateError } = await supabase
+                                .from('profiles')
+                                .update({
+                                    is_canceled: true,
+                                    subscription_plan: 'free'
+                                })
+                                .eq('stripe_customer_id', subscription.customer);
+
+                            if (updateError) {
+                                console.error('❌ Cancellation update error:', updateError);
+                            } else {
+                                console.log('✅ Subscription canceled:', subscription.customer);
+                            }
+                            break;
+                        }
+
+                        default:
+                            console.log('ℹ️ Unhandled event type:', event.type);
+                    }
+
+                    res.json({ received: true });
+
+                } catch (error) {
+                    console.error('❌ Webhook processing error:', error);
+                    res.status(500).json({ error: 'Webhook processing failed' });
+                }
+            }
         );
-        if (r.properties.length > 0) {
-          const sorted = r.properties.sort((a, b) => (a.monthly_rent || a.price || 0) - (b.monthly_rent || b.price || 0));
-          const take = sorted.slice(0, originalParams.maxResults || 1).map(p => ({
-            ...p,
-            isSimilarFallback: true,
-            fallbackStrategy: 'progressive_budget_increase',
-            originalSearchParams: originalParams,
-            budgetIncreased: true,
-            originalBudget: originalParams.maxPrice,
-            newBudget: Math.round(originalParams.maxPrice * m),
-            actualPrice: p.monthly_rent || p.price || 0,
-            budgetIncreasePercent: Math.round((m - 1) * 100),
-            isCheapestAvailable: true,
-          }));
-          return {
-            properties: take,
-            fallbackMessage: `There were no matches in ${originalParams.neighborhood} under $${originalParams.maxPrice.toLocaleString()}, but here's the cheapest we found there:`,
-            apiCalls: r.apiCalls, totalFetched: r.totalFetched, totalAnalyzed: r.totalAnalyzed, claudeApiCalls: r.claudeApiCalls, claudeCost: r.claudeCost,
-          };
-        }
-      }
     }
 
-    if (originalParams.bedrooms) {
-      const r = await this.fetchFromStreetEasy(
-        { ...originalParams, bedrooms: undefined, maxPrice: originalParams.maxPrice ? originalParams.maxPrice * 2 : undefined, undervaluationThreshold: 1 },
-        1,
-        fetchRecordId
-      );
-      if (r.properties.length > 0) {
-        const sorted = r.properties.sort((a, b) => (a.monthly_rent || a.price || 0) - (b.monthly_rent || b.price || 0));
-        const take = sorted.slice(0, originalParams.maxResults || 1).map(p => ({
-          ...p,
-          isSimilarFallback: true,
-          fallbackStrategy: 'bedroom_flexibility',
-          originalSearchParams: originalParams,
-          bedroomFlexible: true,
-          isCheapestAvailable: true,
-        }));
-        return {
-          properties: take,
-          fallbackMessage: `There were no ${originalParams.bedrooms}-bedroom listings in ${originalParams.neighborhood}, but here's the cheapest we found there:`,
-          apiCalls: r.apiCalls, totalFetched: r.totalFetched, totalAnalyzed: r.totalAnalyzed, claudeApiCalls: r.claudeApiCalls, claudeCost: r.claudeCost,
+    setupBillingPortalRoute() {
+        this.app.get('/api/billing/portal', async (req, res) => {
+            try {
+                const { email, stripe_customer_id } = req.query;
+
+                if (!email && !stripe_customer_id) {
+                    return res.status(400).json({
+                        error: 'Email or stripe_customer_id required'
+                    });
+                }
+
+                let customerId = stripe_customer_id;
+
+                if (!customerId && email) {
+                    const supabase = this.getSupabaseClient();
+                    const { data: profile, error } = await supabase
+                        .from('profiles')
+                        .select('stripe_customer_id')
+                        .eq('email_address', email.toLowerCase().trim())
+                        .single();
+
+                    if (error || !profile?.stripe_customer_id) {
+                        return res.status(404).json({
+                            error: 'No subscription found for this email'
+                        });
+                    }
+
+                    customerId = profile.stripe_customer_id;
+                }
+
+                const session = await stripe.billingPortal.sessions.create({
+                    customer: customerId,
+                    return_url: process.env.STRIPE_PORTAL_RETURN_URL
+                });
+
+                console.log('💳 Billing portal created for:', customerId);
+
+                res.json({
+                    success: true,
+                    portalUrl: session.url
+                });
+
+            } catch (error) {
+                console.error('❌ Billing portal error:', error);
+                res.status(500).json({
+                    error: 'Failed to create billing portal',
+                    message: error.message
+                });
+            }
+        });
+    }
+
+    setupErrorHandling() {
+        this.app.use((req, res) => {
+            res.status(404).json({
+                error: 'Not Found',
+                message: 'Endpoint not found',
+                availableEndpoints: '/api'
+            });
+        });
+
+        this.app.use((error, req, res, next) => {
+            console.error('Global error handler:', error);
+            res.status(500).json({
+                error: 'Internal Server Error',
+                message: 'An unexpected error occurred'
+            });
+        });
+    }
+
+    // ============================================================================
+    // EXISTING SMART SEARCH LOGIC (UNCHANGED)
+    // ============================================================================
+
+    async startSmartSearch(jobId, params) {
+        const startTime = Date.now();
+        const job = {
+            status: 'processing',
+            progress: 0,
+            startTime: new Date().toISOString(),
+            lastUpdate: new Date().toISOString(),
+            message: 'Starting smart cache-first search...',
+            originalThreshold: params.undervaluationThreshold,
+            cacheHits: 0,
+            thresholdLowered: false
         };
-      }
-    }
+        
+        this.activeJobs.set(jobId, job);
+        let fetchRecord = null;
 
-    const similarNeighborhoods = this.getSimilarNeighborhoods(originalParams.neighborhood);
-    for (const n of similarNeighborhoods) {
-      const multipliers = originalParams.maxPrice ? [1.0, 1.2, 1.5, 2.0] : [1.0];
-      for (const m of multipliers) {
-        const r = await this.fetchFromStreetEasy(
-          { ...originalParams, neighborhood: n, maxPrice: originalParams.maxPrice ? Math.round(originalParams.maxPrice * m) : undefined, undervaluationThreshold: 1 },
-          1,
-          fetchRecordId
-        );
-        if (r.properties.length > 0) {
-          const sorted = r.properties.sort((a, b) => (a.monthly_rent || a.price || 0) - (b.monthly_rent || b.price || 0));
-          const take = sorted.slice(0, originalParams.maxResults || 1).map(p => ({
-            ...p,
-            isSimilarFallback: true,
-            fallbackStrategy: 'similar_neighborhood',
-            originalSearchParams: originalParams,
-            neighborhoodChanged: true,
-            originalNeighborhood: originalParams.neighborhood,
-            actualNeighborhood: n,
-            isCheapestAvailable: true,
-          }));
-          return {
-            properties: take,
-            fallbackMessage: `There were no matches in ${originalParams.neighborhood}, but here's the cheapest we found in nearby ${n}:`,
-            apiCalls: r.apiCalls, totalFetched: r.totalFetched, totalAnalyzed: r.totalAnalyzed, claudeApiCalls: r.claudeApiCalls, claudeCost: r.claudeCost,
-          };
+        try {
+            console.log('🔍 Step 1: Creating fetch record...');
+            fetchRecord = await this.createFetchRecord(jobId, params);
+            console.log('✅ Step 1 complete - fetch record created');
+
+            job.progress = 20;
+            job.message = 'Checking cache for existing matches...';
+            job.lastUpdate = new Date().toISOString();
+
+            console.log('🔍 Step 2: Starting cache search...');
+            const cacheResults = await this.smartCacheSearch(params);
+            console.log('✅ Step 2 complete - cache search done');
+            job.cacheHits = cacheResults.length;
+
+            if (cacheResults.length >= params.maxResults) {
+                job.status = 'completed';
+                job.progress = 100;
+                job.message = `Found ${cacheResults.length} properties from cache (instant results!)`;
+                
+                await this.updateFetchRecord(fetchRecord.id, {
+                    status: 'completed',
+                    completed_at: new Date().toISOString(),
+                    processing_duration_ms: Date.now() - startTime,
+                    used_cache_only: true,
+                    cache_hits: cacheResults.length,
+                    total_properties_found: cacheResults.length
+                });
+
+                this.jobResults.set(jobId, {
+                    jobId: jobId,
+                    type: 'smart_search',
+                    source: 'cache_only',
+                    parameters: params,
+                    properties: cacheResults,
+                    instagramReady: this.formatInstagramResponse(cacheResults),
+                    instagramSummary: {
+                        hasImages: cacheResults.some(p => p.image_count > 0),
+                        totalImages: cacheResults.reduce((sum, p) => sum + (p.image_count || 0), 0),
+                        primaryImages: cacheResults.map(p => p.primary_image).filter(Boolean),
+                        readyForPosting: cacheResults.filter(p => p.image_count > 0 && p.primary_image)
+                    },
+                    summary: {
+                        totalFound: cacheResults.length,
+                        cacheHits: cacheResults.length,
+                        newlyScraped: 0,
+                        thresholdUsed: params.undervaluationThreshold,
+                        processingTimeMs: Date.now() - startTime
+                    },
+                    completedAt: new Date().toISOString()
+                });
+                return;
+            }
+
+            job.progress = 40;
+            job.message = `Found ${cacheResults.length} cached properties, fetching more from StreetEasy...`;
+            job.lastUpdate = new Date().toISOString();
+
+            console.log('🔍 Step 3: Starting StreetEasy fetch...');
+            const streetEasyResults = await this.fetchWithThresholdFallback(params, fetchRecord.id);
+            console.log('✅ Step 3 complete - StreetEasy fetch done');
+
+            if (streetEasyResults.properties.length === 0 && cacheResults.length === 0) {
+                job.progress = 70;
+                job.message = 'No direct matches found, searching for similar listings...';
+                job.lastUpdate = new Date().toISOString();
+                
+                console.log('🔍 Step 4: Starting similar listings fallback...');
+                const similarResults = await this.fetchSimilarListings(params, fetchRecord.id);
+                console.log('✅ Step 4 complete - similar listings search done');
+                
+                if (similarResults.properties.length === 0) {
+                    job.status = 'completed';
+                    job.progress = 100;
+                    job.message = 'No properties found matching criteria or similar alternatives';
+                    
+                    await this.updateFetchRecord(fetchRecord.id, {
+                        status: 'completed',
+                        completed_at: new Date().toISOString(),
+                        processing_duration_ms: Date.now() - startTime,
+                        total_properties_found: 0
+                    });
+
+                    this.jobResults.set(jobId, {
+                        jobId: jobId,
+                        type: 'smart_search',
+                        source: 'no_results',
+                        parameters: params,
+                        properties: [],
+                        instagramReady: [],
+                        instagramSummary: {
+                            hasImages: false,
+                            totalImages: 0,
+                            primaryImages: [],
+                            readyForPosting: []
+                        },
+                        summary: {
+                            totalFound: 0,
+                            cacheHits: cacheResults.length,
+                            newlyScraped: 0,
+                            thresholdUsed: params.undervaluationThreshold,
+                            processingTimeMs: Date.now() - startTime
+                        },
+                        completedAt: new Date().toISOString()
+                    });
+                    return;
+                } else {
+                    streetEasyResults.properties = similarResults.properties;
+                    streetEasyResults.usedSimilarFallback = true;
+                    streetEasyResults.similarFallbackMessage = similarResults.fallbackMessage;
+                }
+            }
+            
+            job.progress = 90;
+            job.message = 'Combining cached and new results...';
+            job.lastUpdate = new Date().toISOString();
+
+            const combinedResults = this.combineResults(cacheResults, streetEasyResults.properties, params.maxResults);
+            job.thresholdUsed = streetEasyResults.thresholdUsed;
+            job.thresholdLowered = streetEasyResults.thresholdLowered;
+
+            job.status = 'completed';
+            job.progress = 100;
+            
+            if (streetEasyResults.usedSimilarFallback) {
+                job.message = `Found ${combinedResults.length} similar properties (${cacheResults.length} cached + ${streetEasyResults.properties.length} similar)`;
+            } else {
+                job.message = `Found ${combinedResults.length} total properties (${cacheResults.length} cached + ${streetEasyResults.properties.length} new)`;
+            }
+            job.lastUpdate = new Date().toISOString();
+
+            await this.updateFetchRecord(fetchRecord.id, {
+                status: 'completed',
+                completed_at: new Date().toISOString(),
+                processing_duration_ms: Date.now() - startTime,
+                used_cache_only: false,
+                cache_hits: cacheResults.length,
+                total_properties_found: combinedResults.length
+            });
+
+            this.jobResults.set(jobId, {
+                jobId: jobId,
+                type: 'smart_search',
+                source: streetEasyResults.usedSimilarFallback ? 'similar_listings' : 'cache_and_fresh',
+                parameters: params,
+                properties: combinedResults,
+                instagramReady: this.formatInstagramResponse(combinedResults),
+                instagramSummary: {
+                    hasImages: combinedResults.some(p => p.image_count > 0),
+                    totalImages: combinedResults.reduce((sum, p) => sum + (p.image_count || 0), 0),
+                    primaryImages: combinedResults.map(p => p.primary_image).filter(Boolean),
+                    readyForPosting: combinedResults.filter(p => p.image_count > 0 && p.primary_image)
+                },
+                cached: cacheResults,
+                newlyScraped: streetEasyResults.properties,
+                usedSimilarFallback: streetEasyResults.usedSimilarFallback || false,
+                similarFallbackMessage: streetEasyResults.similarFallbackMessage || null,
+                summary: {
+                    totalFound: combinedResults.length,
+                    cacheHits: cacheResults.length,
+                    newlyScraped: streetEasyResults.properties.length,
+                    thresholdUsed: streetEasyResults.thresholdUsed,
+                    thresholdLowered: streetEasyResults.thresholdLowered,
+                    processingTimeMs: Date.now() - startTime,
+                    usedSimilarFallback: streetEasyResults.usedSimilarFallback || false
+                },
+                completedAt: new Date().toISOString()
+            });
+
+        } catch (error) {
+            console.error('❌ REAL ERROR in startSmartSearch:', error.name, error.message);
+            console.error('❌ STACK TRACE:', error.stack);
+            
+            job.status = 'failed';
+            job.error = error.message;
+            job.lastUpdate = new Date().toISOString();
+
+            try {
+                if (fetchRecord?.id) {
+                    await this.updateFetchRecord(fetchRecord.id, {
+                        status: 'failed',
+                        completed_at: new Date().toISOString(),
+                        processing_duration_ms: Date.now() - startTime,
+                        error_message: error.message
+                    });
+                }
+            } catch (updateError) {
+                console.warn('Failed to update fetch record:', updateError.message);
+            }
         }
-      }
     }
 
-    // Last resort (Manhattan cheap)
-    for (const n of ['east-village', 'lower-east-side', 'chinatown', 'financial-district']) {
-      const r = await this.fetchFromStreetEasy(
-        { ...originalParams, neighborhood: n, bedrooms: undefined, maxPrice: undefined, minPrice: undefined, undervaluationThreshold: 1 },
-        1,
-        fetchRecordId
-      );
-      if (r.properties.length > 0) {
-        const sorted = r.properties.sort((a, b) => (a.monthly_rent || a.price || 0) - (b.monthly_rent || b.price || 0));
-        const take = sorted.slice(0, 1).map(p => ({
-          ...p, isSimilarFallback: true, fallbackStrategy: 'last_resort',
-          originalSearchParams: originalParams, isLastResort: true, isCheapestAvailable: true,
-        }));
+    async smartCacheSearch(params) {
+        console.log(`🔍 SKIPPING database cache search for ${params.neighborhood}...`);
+        console.log(`✅ Cache search: 0 properties (database skipped)`);
+        return [];
+    }
+
+    async fetchWithThresholdFallback(params, fetchRecordId) {
+        const thresholds = [params.undervaluationThreshold];
+        
+        for (const step of this.thresholdSteps) {
+            const lowerThreshold = params.undervaluationThreshold - step;
+            if (lowerThreshold >= 1) {
+                thresholds.push(lowerThreshold);
+            }
+        }
+
+        let allResults = [];
+        let apiCalls = 0;
+        let totalFetched = 0;
+        let totalAnalyzed = 0;
+        let claudeApiCalls = 0;
+        let claudeTokens = 0;
+        let claudeCost = 0;
+        let thresholdUsed = params.undervaluationThreshold;
+        let thresholdLowered = false;
+
+        for (const threshold of thresholds) {
+            console.log(`🎯 Trying threshold: ${threshold}%`);
+            
+            const results = await this.fetchFromStreetEasy(params, threshold, fetchRecordId);
+            
+            apiCalls += results.apiCalls;
+            totalFetched += results.totalFetched;
+            totalAnalyzed += results.totalAnalyzed;
+            claudeApiCalls += results.claudeApiCalls;
+            claudeTokens += results.claudeTokens;
+            claudeCost += results.claudeCost;
+
+            if (results.properties.length > 0) {
+                thresholdUsed = threshold;
+                thresholdLowered = threshold < params.undervaluationThreshold;
+                allResults = results.properties;
+                break;
+            }
+        }
+
         return {
-          properties: take,
-          fallbackMessage: `We couldn't find what you were looking for in ${originalParams.neighborhood}, but here's the cheapest in Manhattan:`,
-          apiCalls: r.apiCalls, totalFetched: r.totalFetched, totalAnalyzed: r.totalAnalyzed, claudeApiCalls: r.claudeApiCalls, claudeCost: r.claudeCost,
+            properties: allResults,
+            thresholdUsed,
+            thresholdLowered,
+            apiCalls,
+            totalFetched,
+            totalAnalyzed,
+            claudeApiCalls,
+            claudeTokens,
+            claudeCost
         };
-      }
     }
 
-    return { properties: [], fallbackMessage: null, apiCalls: 0, totalFetched: 0, totalAnalyzed: 0, claudeApiCalls: 0, claudeCost: 0 };
-  }
+    async fetchSimilarListings(originalParams, fetchRecordId) {
+        console.log('🔄 PROGRESSIVE FALLBACK: Starting search...');
+        
+        if (originalParams.maxPrice) {
+            const budgetMultipliers = [1.2, 1.5, 2.0, 3.0, 5.0, 10.0];
+            
+            for (const multiplier of budgetMultipliers) {
+                const newBudget = Math.round(originalParams.maxPrice * multiplier);
+                
+                const results = await this.fetchFromStreetEasy({
+                    ...originalParams,
+                    maxPrice: newBudget,
+                    minPrice: undefined,
+                    undervaluationThreshold: 1
+                }, 1, fetchRecordId);
+                
+                if (results.properties.length > 0) {
+                    const sortedProperties = results.properties.sort((a, b) => {
+                        const priceA = a.monthly_rent || a.price || 0;
+                        const priceB = b.monthly_rent || b.price || 0;
+                        return priceA - priceB;
+                    });
+                    
+                    const cheapestProperties = sortedProperties.slice(0, originalParams.maxResults || 1);
+                    
+                    const markedProperties = cheapestProperties.map(prop => ({
+                        ...prop,
+                        isSimilarFallback: true,
+                        fallbackStrategy: 'progressive_budget_increase'
+                    }));
+                    
+                    return {
+                        properties: markedProperties,
+                        fallbackMessage: 'No properties found under budget, here is the cheapest available:',
+                        fallbackStrategy: 'progressive_budget_increase',
+                        apiCalls: results.apiCalls,
+                        totalFetched: results.totalFetched,
+                        totalAnalyzed: results.totalAnalyzed,
+                        claudeApiCalls: results.claudeApiCalls || 0,
+                        claudeTokens: results.claudeTokens || 0,
+                        claudeCost: results.claudeCost || 0
+                    };
+                }
+            }
+        }
 
-  getSimilarNeighborhoods(n) {
-    const g = {
-      soho: ['tribeca','nolita','west-village','east-village','lower-east-side'],
-      tribeca: ['soho','financial-district','west-village','battery-park-city'],
-      'west-village': ['soho','tribeca','east-village','chelsea','meatpacking-district'],
-      'east-village': ['west-village','lower-east-side','nolita','gramercy'],
-      'lower-east-side': ['east-village','chinatown','nolita','two-bridges'],
-      nolita: ['soho','east-village','lower-east-side','little-italy'],
-      chelsea: ['west-village','gramercy','flatiron','meatpacking-district'],
-      gramercy: ['chelsea','east-village','murray-hill','flatiron'],
-      'upper-west-side': ['upper-east-side','morningside-heights','harlem','lincoln-square'],
-      'upper-east-side': ['upper-west-side','yorkville','midtown-east'],
-      harlem: ['morningside-heights','upper-west-side','washington-heights','east-harlem'],
-      williamsburg: ['greenpoint','bushwick','dumbo','bedstuy'],
-      bushwick: ['williamsburg','bedstuy','ridgewood','east-williamsburg'],
-      'park-slope': ['prospect-heights','gowanus','carroll-gardens','windsor-terrace'],
-      dumbo: ['brooklyn-heights','downtown-brooklyn','williamsburg','vinegar-hill'],
-      astoria: ['long-island-city','sunnyside','woodside','jackson-heights'],
-      'long-island-city': ['astoria','sunnyside','hunters-point'],
-    };
-    return g[(n || '').toLowerCase()] || ['east-village','lower-east-side','chinatown'];
-  }
-
-  async fetchFromStreetEasy(params, threshold) {
-    try {
-      console.log(`📡 StreetEasy fetch: ${params.neighborhood}, threshold: ${threshold}%`);
-      const apiUrl = params.propertyType === 'rental'
-        ? 'https://streeteasy-api.p.rapidapi.com/rentals/search'
-        : 'https://streeteasy-api.p.rapidapi.com/sales/search';
-
-      const apiParams = { areas: params.neighborhood, limit: Math.min(20, (params.maxResults || 1) * 4), offset: 0 };
-      if (params.minPrice) apiParams.minPrice = params.minPrice;
-      if (params.maxPrice) apiParams.maxPrice = params.maxPrice;
-      if (params.bedrooms) { apiParams.minBeds = params.bedrooms; apiParams.maxBeds = params.bedrooms; }
-      if (params.bathrooms) { if (params.propertyType === 'rental') apiParams.minBath = params.bathrooms; else apiParams.minBaths = params.bathrooms; }
-
-      const amenityFilters = [];
-      if (params.noFee && params.propertyType === 'rental') apiParams.noFee = true;
-      if (params.doorman) amenityFilters.push('doorman');
-      if (params.elevator) amenityFilters.push('elevator');
-      if (params.laundry) amenityFilters.push('laundry');
-      if (params.privateOutdoorSpace) amenityFilters.push('private_outdoor_space');
-      if (params.washerDryer) amenityFilters.push('washer_dryer');
-      if (params.dishwasher) amenityFilters.push('dishwasher');
-      if (amenityFilters.length) apiParams.amenities = amenityFilters.join(',');
-      if (params.propertyType === 'sale' && params.propertyTypes?.length) apiParams.types = params.propertyTypes.join(',');
-
-      const response = await axios.get(apiUrl, {
-        params: apiParams,
-        headers: { 'X-RapidAPI-Key': this.rapidApiKey, 'X-RapidAPI-Host': 'streeteasy-api.p.rapidapi.com' },
-        timeout: 30000,
-      });
-
-      let listings = [];
-      if (Array.isArray(response.data)) listings = response.data;
-      else if (Array.isArray(response.data?.results)) listings = response.data.results;
-      else if (Array.isArray(response.data?.listings)) listings = response.data.listings;
-
-      if (!listings.length) {
-        return { properties: [], apiCalls: 1, totalFetched: 0, totalAnalyzed: 0, claudeApiCalls: 0, claudeTokens: 0, claudeCost: 0 };
-      }
-
-      const analysis = await this.analyzePropertiesWithClaude(listings, params, threshold);
-      const saved = await this.savePropertiesToDatabase(analysis.qualifyingProperties, params.propertyType, null);
-      return {
-        properties: saved,
-        apiCalls: 1,
-        totalFetched: listings.length,
-        totalAnalyzed: listings.length,
-        claudeApiCalls: analysis.claudeApiCalls,
-        claudeTokens: analysis.claudeTokens,
-        claudeCost: analysis.claudeCost,
-      };
-    } catch (e) {
-      console.error('❌ StreetEasy fetch error:', e.message);
-      return { properties: [], apiCalls: 1, totalFetched: 0, totalAnalyzed: 0, claudeApiCalls: 0, claudeTokens: 0, claudeCost: 0, error: e.message };
+        return {
+            properties: [],
+            fallbackMessage: null,
+            fallbackStrategy: 'none',
+            apiCalls: 0,
+            totalFetched: 0,
+            totalAnalyzed: 0,
+            claudeApiCalls: 0,
+            claudeTokens: 0,
+            claudeCost: 0
+        };
     }
-  }
 
-  async analyzePropertyBatchWithClaude(properties, params, threshold) {
-    const prompt = this.buildDetailedClaudePrompt(properties, params, threshold);
-    try {
-      const r = await axios.post(
-        'https://api.anthropic.com/v1/messages',
-        { model: 'claude-3-haiku-20240307', max_tokens: 2000, temperature: 0.1, messages: [{ role: 'user', content: prompt }] },
-        { headers: { 'Content-Type': 'application/json', 'X-API-Key': this.claudeApiKey, 'anthropic-version': '2023-06-01' } }
-      );
-      const analysis = JSON.parse(r.data.content[0].text);
-      const tokensUsed = (r.data.usage?.input_tokens || 0) + (r.data.usage?.output_tokens || 0);
-      const cost = (tokensUsed / 1_000_000) * 1.25;
+    async fetchFromStreetEasy(params, threshold, fetchRecordId) {
+        try {
+            const apiUrl = params.propertyType === 'rental' 
+                ? 'https://streeteasy-api.p.rapidapi.com/rentals/search'
+                : 'https://streeteasy-api.p.rapidapi.com/sales/search';
+            
+            const apiParams = {
+                areas: params.neighborhood,
+                limit: Math.min(20, params.maxResults * 4),
+                offset: 0
+            };
 
-      const qualifyingProperties = properties
-        .map((prop, i) => {
-          const a = analysis.find(x => x.propertyIndex === i + 1) || { percentBelowMarket: 0, isUndervalued: false, reasoning: 'Analysis failed', score: 0, grade: 'F' };
-          return { ...prop, discount_percent: a.percentBelowMarket, isUndervalued: a.isUndervalued, reasoning: a.reasoning, score: a.score || 0, grade: a.grade || 'F', analyzed: true };
-        })
-        .filter(p => p.discount_percent >= threshold);
+            if (params.minPrice) apiParams.minPrice = params.minPrice;
+            if (params.maxPrice) apiParams.maxPrice = params.maxPrice;
+            if (params.bedrooms) {
+                apiParams.minBeds = params.bedrooms;
+                apiParams.maxBeds = params.bedrooms;
+            }
+            if (params.bathrooms) {
+                apiParams.minBath = params.bathrooms;
+            }
+            if (params.noFee && params.propertyType === 'rental') {
+                apiParams.noFee = true;
+            }
 
-      return { qualifyingProperties, tokensUsed, cost };
-    } catch (e) {
-      console.warn('⚠️ Claude batch analysis failed:', e.message);
-      return { qualifyingProperties: [], tokensUsed: 0, cost: 0 };
+            const response = await axios.get(apiUrl, {
+                params: apiParams,
+                headers: {
+                    'X-RapidAPI-Key': this.rapidApiKey,
+                    'X-RapidAPI-Host': 'streeteasy-api.p.rapidapi.com'
+                },
+                timeout: 30000
+            });
+
+            let listings = [];
+            if (response.data?.results && Array.isArray(response.data.results)) {
+                listings = response.data.results;
+            } else if (response.data?.listings && Array.isArray(response.data.listings)) {
+                listings = response.data.listings;
+            } else if (Array.isArray(response.data)) {
+                listings = response.data;
+            }
+
+            if (listings.length === 0) {
+                return {
+                    properties: [],
+                    apiCalls: 1,
+                    totalFetched: 0,
+                    totalAnalyzed: 0,
+                    claudeApiCalls: 0,
+                    claudeTokens: 0,
+                    claudeCost: 0
+                };
+            }
+
+            const analysisResults = await this.analyzePropertiesWithClaude(listings, params, threshold);
+            const savedProperties = await this.savePropertiesToDatabase(
+                analysisResults.qualifyingProperties, 
+                params.propertyType, 
+                fetchRecordId
+            );
+
+            return {
+                properties: savedProperties,
+                apiCalls: 1,
+                totalFetched: listings.length,
+                totalAnalyzed: listings.length,
+                claudeApiCalls: analysisResults.claudeApiCalls,
+                claudeTokens: analysisResults.claudeTokens,
+                claudeCost: analysisResults.claudeCost
+            };
+
+        } catch (error) {
+            console.error('❌ StreetEasy fetch error:', error.message);
+            return {
+                properties: [],
+                apiCalls: 1,
+                totalFetched: 0,
+                totalAnalyzed: 0,
+                claudeApiCalls: 0,
+                claudeTokens: 0,
+                claudeCost: 0
+            };
+        }
     }
-  }
 
-  async analyzePropertiesWithClaude(listings, params, threshold) {
-    const batchSize = 50;
-    let all = [], calls = 0, tokens = 0, cost = 0;
-    for (let i = 0; i < listings.length; i += batchSize) {
-      const batch = listings.slice(i, i + batchSize);
-      const r = await this.analyzePropertyBatchWithClaude(batch, params, threshold);
-      all.push(...r.qualifyingProperties); calls += 1; tokens += r.tokensUsed; cost += r.cost;
-      if (i + batchSize < listings.length) await this.delay(1000);
+    async analyzePropertiesWithClaude(listings, params, threshold) {
+        const batchSize = 50;
+        let allQualifyingProperties = [];
+        let totalClaudeApiCalls = 0;
+        let totalClaudeTokens = 0;
+        let totalClaudeCost = 0;
+
+        for (let i = 0; i < listings.length; i += batchSize) {
+            const batch = listings.slice(i, i + batchSize);
+            
+            const batchResults = await this.analyzePropertyBatchWithClaude(batch, params, threshold);
+            
+            allQualifyingProperties.push(...batchResults.qualifyingProperties);
+            totalClaudeApiCalls += 1;
+            totalClaudeTokens += batchResults.tokensUsed;
+            totalClaudeCost += batchResults.cost;
+            
+            if (i + batchSize < listings.length) {
+                await this.delay(1000);
+            }
+        }
+
+        return {
+            qualifyingProperties: allQualifyingProperties,
+            claudeApiCalls: totalClaudeApiCalls,
+            claudeTokens: totalClaudeTokens,
+            claudeCost: totalClaudeCost
+        };
     }
-    return { qualifyingProperties: all, claudeApiCalls: calls, claudeTokens: tokens, claudeCost: cost };
-  }
 
-  buildDetailedClaudePrompt(properties, params, threshold) {
-    return `You are an expert NYC real estate analyst. Analyze these ${params.propertyType} properties in ${params.neighborhood} for undervaluation potential.
+    async analyzePropertyBatchWithClaude(properties, params, threshold) {
+        const prompt = this.buildDetailedClaudePrompt(properties, params, threshold);
+
+        try {
+            const response = await axios.post('https://api.anthropic.com/v1/messages', {
+                model: 'claude-3-haiku-20240307',
+                max_tokens: 2000,
+                temperature: 0.1,
+                messages: [{
+                    role: 'user',
+                    content: prompt
+                }]
+            }, {
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-Key': this.claudeApiKey,
+                    'anthropic-version': '2023-06-01'
+                }
+            });
+
+            const analysis = JSON.parse(response.data.content[0].text);
+            const tokensUsed = response.data.usage?.input_tokens + response.data.usage?.output_tokens || 1500;
+            const cost = (tokensUsed / 1000000) * 1.25;
+
+            const qualifyingProperties = properties
+                .map((prop, i) => {
+                    const propAnalysis = analysis.find(a => a.propertyIndex === i + 1) || {
+                        percentBelowMarket: 0,
+                        isUndervalued: false,
+                        reasoning: 'Analysis failed',
+                        score: 0,
+                        grade: 'F'
+                    };
+                    
+                    return {
+                        ...prop,
+                        discount_percent: propAnalysis.percentBelowMarket,
+                        isUndervalued: propAnalysis.isUndervalued,
+                        reasoning: propAnalysis.reasoning,
+                        score: propAnalysis.score || 0,
+                        grade: propAnalysis.grade || 'F',
+                        analyzed: true
+                    };
+                })
+                .filter(prop => prop.discount_percent >= threshold);
+
+            return {
+                qualifyingProperties,
+                tokensUsed,
+                cost
+            };
+
+        } catch (error) {
+            console.warn('⚠️ Claude analysis failed:', error.message);
+            return {
+                qualifyingProperties: [],
+                tokensUsed: 0,
+                cost: 0
+            };
+        }
+    }
+
+    buildDetailedClaudePrompt(properties, params, threshold) {
+        return `You are an expert NYC real estate analyst. Analyze these ${params.propertyType} properties in ${params.neighborhood} for undervaluation potential.
 
 PROPERTIES TO ANALYZE:
 ${properties.map((prop, i) => `
@@ -899,198 +1322,249 @@ Property ${i + 1}:
 - Address: ${prop.address || 'Not listed'}
 - ${params.propertyType === 'rental' ? 'Monthly Rent' : 'Sale Price'}: ${prop.price?.toLocaleString() || 'Not listed'}
 - Layout: ${prop.bedrooms || 'N/A'}BR/${prop.bathrooms || 'N/A'}BA
-- Square Feet: ${prop.sqft || 'Not listed'}
-- Description: ${prop.description?.substring(0, 300) || 'None'}...
-- Amenities: ${prop.amenities?.join(', ') || 'None listed'}
-- Building Year: ${prop.built_in || 'Unknown'}
-- Days on Market: ${prop.days_on_market || 'Unknown'}` ).join('\n')}
+`).join('\n')}
 
-ANALYSIS REQUIREMENTS:
-- Evaluate each property against typical ${params.neighborhood} market rates
-- Consider location, amenities, condition, and comps
-- Only mark as undervalued if discount is ${threshold}% or greater
-- Provide score (0-100) and grade (A+ to F)
+Respond with ONLY a valid JSON array:
 
-CRITICAL: Return ONLY a JSON array.
-
-[{"propertyIndex":1,"percentBelowMarket":20,"isUndervalued":true,"reasoning":"...","score":85,"grade":"A-"}]`;
+[
+  {
+    "propertyIndex": 1,
+    "percentBelowMarket": 20,
+    "isUndervalued": true,
+    "reasoning": "Brief explanation",
+    "score": 85,
+    "grade": "A-"
   }
-
-  async savePropertiesToDatabase(properties, propertyType, fetchRecordId) {
-    if (!properties.length) return [];
-    console.log(`💾 SKIPPING database save of ${properties.length} properties…`);
-    return properties.map(p => this.formatPropertyForDatabase(p, propertyType, fetchRecordId));
-  }
-
-  formatPropertyForDatabase(property, propertyType, fetchRecordId) {
-    const extracted = this.extractAndFormatImages(property);
-    const base = {
-      fetch_job_id: fetchRecordId,
-      listing_id: property.id || property.listing_id || `generated_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`,
-      address: property.address || '',
-      neighborhood: property.neighborhood || '',
-      borough: this.getBoroughFromNeighborhood(property.neighborhood || ''),
-      zipcode: property.zipcode || property.zip_code || '',
-      bedrooms: property.bedrooms || 0,
-      bathrooms: property.bathrooms || 0,
-      sqft: property.sqft || null,
-      discount_percent: property.discount_percent || 0,
-      score: property.score || 0,
-      grade: property.grade || 'F',
-      reasoning: property.reasoning || '',
-      comparison_method: 'claude_ai_analysis',
-      description: property.description || '',
-      amenities: property.amenities || [],
-      images: extracted.processedImages,
-      image_count: extracted.count,
-      primary_image: extracted.primary,
-      instagram_ready_images: extracted.instagramReady,
-      listing_url: property.url || property.listing_url || '',
-      built_in: property.built_in || property.year_built || null,
-      days_on_market: property.days_on_market || 0,
-      status: 'active',
-    };
-
-    if (propertyType === 'rental') {
-      return {
-        ...base,
-        monthly_rent: property.price || 0,
-        potential_monthly_savings: Math.round(((property.price || 0) * (property.discount_percent || 0)) / 100),
-        annual_savings: Math.round(((property.price || 0) * (property.discount_percent || 0) * 12) / 100),
-        no_fee: property.no_fee || property.noFee || false,
-        doorman_building: property.doorman_building || false,
-        elevator_building: property.elevator_building || false,
-        pet_friendly: property.pet_friendly || false,
-        laundry_available: property.laundry_available || false,
-        gym_available: property.gym_available || false,
-        rooftop_access: property.rooftop_access || false,
-      };
-    } else {
-      return {
-        ...base,
-        price: property.price || 0,
-        potential_savings: Math.round(((property.price || 0) * (property.discount_percent || 0)) / 100),
-        estimated_market_price: Math.round((property.price || 0) / (1 - (property.discount_percent || 0) / 100)),
-        monthly_hoa: property.monthly_hoa || null,
-        monthly_tax: property.monthly_tax || null,
-        property_type: property.property_type || 'unknown',
-      };
+]`;
     }
-  }
 
-  extractAndFormatImages(property) {
-    try {
-      let raw = [];
-      if (Array.isArray(property.images)) raw = property.images;
-      else if (Array.isArray(property.photos)) raw = property.photos;
-      else if (property.media?.images) raw = property.media.images;
-      else if (property.listingPhotos) raw = property.listingPhotos;
-
-      const processed = raw
-        .filter(img => (typeof img === 'string' && img) || (img && img.url))
-        .map(img => this.optimizeImageForInstagram(typeof img === 'string' ? img : img.url))
-        .filter(Boolean)
-        .slice(0, 10);
-
-      const primary = processed[0] || null;
-      const instagramReady = processed.map((u, i) => ({
-        url: u,
-        caption: this.generateImageCaption(property, i),
-        altText: `${property.address} - Photo ${i + 1}`,
-        isPrimary: i === 0,
-      }));
-
-      return { processedImages: processed, count: processed.length, primary, instagramReady };
-    } catch (e) {
-      console.warn('Image extraction error:', e.message);
-      return { processedImages: [], count: 0, primary: null, instagramReady: [] };
+    async savePropertiesToDatabase(properties, propertyType, fetchRecordId) {
+        if (properties.length === 0) return [];
+        
+        const formattedProperties = properties.map(property => 
+            this.formatPropertyForDatabase(property, propertyType, fetchRecordId)
+        );
+        
+        return formattedProperties;
     }
-  }
 
-  optimizeImageForInstagram(url) {
-    if (!url) return null;
-    try {
-      if (url.includes('streeteasy.com')) {
-        return url.replace('/small/', '/large/').replace('/medium/', '/large/').replace('_sm.', '_lg.').replace('_md.', '_lg.');
-      }
-      return url.startsWith('https://') ? url : url.replace('http://', 'https://');
-    } catch {
-      return url;
+    formatPropertyForDatabase(property, propertyType, fetchRecordId) {
+        const extractedImages = this.extractAndFormatImages(property);
+        
+        const baseData = {
+            fetch_job_id: fetchRecordId,
+            listing_id: property.id || `generated_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+            address: property.address || '',
+            neighborhood: property.neighborhood || '',
+            borough: this.getBoroughFromNeighborhood(property.neighborhood || ''),
+            bedrooms: property.bedrooms || 0,
+            bathrooms: property.bathrooms || 0,
+            sqft: property.sqft || null,
+            discount_percent: property.discount_percent || 0,
+            score: property.score || 0,
+            grade: property.grade || 'F',
+            reasoning: property.reasoning || '',
+            images: extractedImages.processedImages,
+            image_count: extractedImages.count,
+            primary_image: extractedImages.primary,
+            instagram_ready_images: extractedImages.instagramReady,
+            listing_url: property.url || property.listing_url || '',
+            status: 'active'
+        };
+
+        if (propertyType === 'rental') {
+            return {
+                ...baseData,
+                monthly_rent: property.price || 0,
+                potential_monthly_savings: Math.round((property.price || 0) * (property.discount_percent || 0) / 100),
+                annual_savings: Math.round((property.price || 0) * (property.discount_percent || 0) / 100 * 12)
+            };
+        } else {
+            return {
+                ...baseData,
+                price: property.price || 0,
+                potential_savings: Math.round((property.price || 0) * (property.discount_percent || 0) / 100)
+            };
+        }
     }
-  }
 
-  generateImageCaption(p, i) {
-    const price = p.monthly_rent || p.price;
-    const priceText = p.monthly_rent ? `${price?.toLocaleString()}/month` : `${price?.toLocaleString()}`;
-    return i === 0
-      ? `🏠 ${p.bedrooms}BR/${p.bathrooms}BA in ${p.neighborhood}\n💰 ${priceText} (${p.discount_percent}% below market)\n📍 ${p.address}`
-      : `📸 ${p.address} - Photo ${i + 1}`;
-  }
+    extractAndFormatImages(property) {
+        try {
+            let rawImages = [];
+            
+            if (property.images && Array.isArray(property.images)) {
+                rawImages = property.images;
+            } else if (property.photos && Array.isArray(property.photos)) {
+                rawImages = property.photos;
+            }
 
-  generateInstagramDMMessage(p) {
-    const price = p.monthly_rent || p.price;
-    const priceText = p.monthly_rent ? `$${price?.toLocaleString()}/month` : `$${price?.toLocaleString()}`;
-    const savings = p.potential_monthly_savings || p.potential_savings;
+            const processedImages = rawImages
+                .filter(img => img && typeof img === 'string' || (img && img.url))
+                .map(img => {
+                    const imageUrl = typeof img === 'string' ? img : img.url;
+                    return this.optimizeImageForInstagram(imageUrl);
+                })
+                .filter(Boolean)
+                .slice(0, 10);
 
-    let msg = p.isSimilarFallback ? '🔄 *ALTERNATIVE FOUND*\n\n' : '🏠 *UNDERVALUED PROPERTY ALERT*\n\n';
-    msg += `📍 **${p.address}**\n🏘️ ${p.neighborhood}, ${p.borough}\n\n💰 **${priceText}**\n`;
-    msg += p.isSimilarFallback ? '💡 Cheapest available option\n\n' : `📉 ${p.discount_percent}% below market\n💵 Save $${savings?.toLocaleString()} ${p.monthly_rent ? 'per month' : 'total'}\n\n`;
-    msg += `🏠 ${p.bedrooms}BR/${p.bathrooms}BA${p.sqft ? ` | ${p.sqft} sqft` : ''}\n📊 Score: ${p.score}/100 (${p.grade})\n\n`;
-    const amenities = [];
-    if (p.no_fee) amenities.push('No Fee');
-    if (p.doorman_building) amenities.push('Doorman');
-    if (p.elevator_building) amenities.push('Elevator');
-    if (p.pet_friendly) amenities.push('Pet Friendly');
-    if (p.gym_available) amenities.push('Gym');
-    if (amenities.length) msg += `✨ ${amenities.join(' • ')}\n\n`;
-    msg += `🧠 *AI Analysis:*\n"${(p.reasoning || '').substring(0, 150)}..."\n\n`;
-    msg += `🔗 [View Full Listing](${p.listing_url})`;
-    return msg;
-  }
+            const primaryImage = processedImages.length > 0 ? processedImages[0] : null;
 
-  formatInstagramResponse(props) {
-    return props.map(p => ({
-      ...p,
-      instagram: {
-        primaryImage: p.primary_image,
-        imageCount: p.image_count,
-        images: p.instagram_ready_images || [],
-        dmMessage: this.generateInstagramDMMessage(p),
-      },
-    }));
-  }
+            const instagramReady = processedImages.map((img, index) => ({
+                url: img,
+                caption: this.generateImageCaption(property, index),
+                isPrimary: index === 0
+            }));
 
-  combineResults(cacheResults, newResults, maxResults) {
-    const combined = [...cacheResults];
-    const seen = new Set(cacheResults.map(r => r.listing_id));
-    for (const r of newResults) if (!seen.has(r.listing_id)) combined.push({ ...r, source: 'fresh', isCached: false });
-    return combined.sort((a, b) => (b.discount_percent || 0) - (a.discount_percent || 0)).slice(0, maxResults);
-  }
+            return {
+                processedImages: processedImages,
+                count: processedImages.length,
+                primary: primaryImage,
+                instagramReady: instagramReady
+            };
 
-  async createFetchRecord(jobId, params) { console.log('🔍 SKIPPING database - fake record'); return { id: `fake_${jobId}`, job_id: jobId, status: 'processing', neighborhood: params.neighborhood, property_type: params.propertyType }; }
-  async updateFetchRecord(_id, updates) { console.log('🔍 SKIPPING database update:', updates.status || 'processing'); }
+        } catch (error) {
+            return {
+                processedImages: [],
+                count: 0,
+                primary: null,
+                instagramReady: []
+            };
+        }
+    }
 
-  getBoroughFromNeighborhood(n) {
-    const m = { soho:'Manhattan', tribeca:'Manhattan', 'west-village':'Manhattan', 'east-village':'Manhattan', 'lower-east-side':'Manhattan', chinatown:'Manhattan', 'financial-district':'Manhattan', 'battery-park-city':'Manhattan', chelsea:'Manhattan', gramercy:'Manhattan', 'murray-hill':'Manhattan', midtown:'Manhattan', "hell-s-kitchen":'Manhattan', 'upper-west-side':'Manhattan', 'upper-east-side':'Manhattan', harlem:'Manhattan', 'washington-heights':'Manhattan', williamsburg:'Brooklyn', bushwick:'Brooklyn', bedstuy:'Brooklyn', 'park-slope':'Brooklyn', 'red-hook':'Brooklyn', dumbo:'Brooklyn', 'brooklyn-heights':'Brooklyn', 'carroll-gardens':'Brooklyn', 'cobble-hill':'Brooklyn', 'fort-greene':'Brooklyn', 'prospect-heights':'Brooklyn', 'crown-heights':'Brooklyn', astoria:'Queens', 'long-island-city':'Queens', 'forest-hills':'Queens', flushing:'Queens', elmhurst:'Queens', 'jackson-heights':'Queens', 'mott-haven':'Bronx', 'south-bronx':'Bronx', concourse:'Bronx', fordham:'Bronx', riverdale:'Bronx' };
-    return m[n?.toLowerCase()] || 'Unknown';
-  }
+    optimizeImageForInstagram(imageUrl) {
+        if (!imageUrl) return null;
+        
+        try {
+            if (imageUrl.includes('streeteasy.com')) {
+                return imageUrl
+                    .replace('/small/', '/large/')
+                    .replace('/medium/', '/large/');
+            }
+            
+            return imageUrl.startsWith('https://') ? imageUrl : imageUrl.replace('http://', 'https://');
+            
+        } catch (error) {
+            return imageUrl;
+        }
+    }
 
-  generateJobId() { return `smart_${Date.now()}_${Math.random().toString(36).slice(2, 11)}`; }
-  delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+    generateImageCaption(property, imageIndex) {
+        const price = property.monthly_rent || property.price;
+        const priceText = property.monthly_rent ? `${price?.toLocaleString()}/month` : `${price?.toLocaleString()}`;
+        
+        if (imageIndex === 0) {
+            return `🏠 ${property.bedrooms}BR/${property.bathrooms}BA in ${property.neighborhood}\n💰 ${priceText}`;
+        } else {
+            return `📸 ${property.address} - Photo ${imageIndex + 1}`;
+        }
+    }
 
-  start() {
-    this.app.listen(this.port, () => {
-      console.log(`🚀 API running on port ${this.port}`);
-      console.log(`📊 Docs: http://localhost:${this.port}/api`);
-      console.log(`🧠 Mode: Smart cache-first + IG checkout`);
-      console.log(`🔗 Stripe Link (base): ${this.STRIPE_CHECKOUT_URL}`);
-    });
-  }
+    generateInstagramDMMessage(property) {
+        const price = property.monthly_rent || property.price;
+        const priceText = property.monthly_rent ? `${price?.toLocaleString()}/month` : `${price?.toLocaleString()}`;
+        const savings = property.potential_monthly_savings || property.potential_savings;
+        
+        let message = property.isSimilarFallback ? '🔄 *ALTERNATIVE FOUND*\n\n' : '🏠 *UNDERVALUED PROPERTY ALERT*\n\n';
+        
+        message += `📍 **${property.address}**\n`;
+        message += `🏘️ ${property.neighborhood}, ${property.borough}\n\n`;
+        message += `💰 **${priceText}**\n`;
+        
+        if (!property.isSimilarFallback) {
+            message += `📉 ${property.discount_percent}% below market\n`;
+            message += `💵 Save ${savings?.toLocaleString()} ${property.monthly_rent ? 'per month' : 'total'}\n\n`;
+        }
+        
+        message += `🏠 ${property.bedrooms}BR/${property.bathrooms}BA`;
+        if (property.sqft) message += ` | ${property.sqft} sqft`;
+        message += `\n📊 Score: ${property.score}/100 (${property.grade})\n\n`;
+        message += `🧠 *AI Analysis:*\n"${property.reasoning?.substring(0, 150)}..."\n\n`;
+        message += `🔗 [View Full Listing](${property.listing_url})`;
+        
+        return message;
+    }
+
+    formatInstagramResponse(properties) {
+        return properties.map(property => ({
+            ...property,
+            instagram: {
+                primaryImage: property.primary_image,
+                imageCount: property.image_count,
+                images: property.instagram_ready_images || [],
+                dmMessage: this.generateInstagramDMMessage(property)
+            }
+        }));
+    }
+
+    combineResults(cacheResults, newResults, maxResults) {
+        const combined = [...cacheResults];
+        const existingIds = new Set(cacheResults.map(r => r.listing_id));
+
+        for (const newResult of newResults) {
+            if (!existingIds.has(newResult.listing_id)) {
+                combined.push({
+                    ...newResult,
+                    source: 'fresh',
+                    isCached: false
+                });
+            }
+        }
+
+        return combined
+            .sort((a, b) => (b.discount_percent || 0) - (a.discount_percent || 0))
+            .slice(0, maxResults);
+    }
+
+    async createFetchRecord(jobId, params) {
+        return { 
+            id: `fake_${jobId}`,
+            job_id: jobId,
+            status: 'processing'
+        };
+    }
+
+    async updateFetchRecord(id, updates) {
+        return;
+    }
+
+    getBoroughFromNeighborhood(neighborhood) {
+        const boroughMap = {
+            'soho': 'Manhattan',
+            'tribeca': 'Manhattan',
+            'williamsburg': 'Brooklyn',
+            'bushwick': 'Brooklyn',
+            'astoria': 'Queens'
+        };
+        
+        return boroughMap[neighborhood.toLowerCase()] || 'Unknown';
+    }
+
+    generateJobId() {
+        return `smart_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    }
+
+    delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    start() {
+        this.app.listen(this.port, () => {
+            console.log(`🚀 NYC Real Estate API Server running on port ${this.port}`);
+            console.log(`📊 API Documentation: http://localhost:${this.port}/api`);
+            console.log(`💳 Stripe Integration: ENABLED`);
+            console.log(`📧 Supabase Integration: ENABLED`);
+            console.log(`🎯 New Routes:`);
+            console.log(`   POST /api/preferences/save (no auth)`);
+            console.log(`   POST /api/stripe/webhook (no auth)`);
+            console.log(`   GET /api/billing/portal (no auth)`);
+        });
+    }
 }
 
 if (require.main === module) {
-  const api = new SmartCacheFirstAPI();
-  api.start();
+    const api = new SmartCacheFirstAPI();
+    api.start();
 }
 
 module.exports = SmartCacheFirstAPI;
